@@ -1951,6 +1951,20 @@ class HermesCLI:
             self._last_invalidate = now
             self._app.invalidate()
 
+    def _periodic_tui_refresh_interval(self) -> Optional[float]:
+        """Return the background repaint interval for dynamic TUI widgets.
+
+        The classic CLI renders conversation output into the terminal's native
+        scrollback. Repainting the prompt_toolkit footer while idle forcibly
+        yanks the viewport back to the bottom in many terminals, so we only run
+        periodic invalidates for UI elements that are visibly time-varying.
+        """
+        if getattr(self, "_command_running", False):
+            return 0.1
+        if getattr(self, "_tool_start_time", 0.0) > 0:
+            return 0.15
+        return None
+
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
             return "class:status-bar-dim"
@@ -9945,24 +9959,20 @@ class HermesCLI:
         def spinner_loop():
             import time as _time
 
-            last_idle_refresh = 0.0
             while not self._should_exit:
                 if not self._app:
                     _time.sleep(0.1)
                     continue
-                if self._command_running:
-                    self._invalidate(min_interval=0.1)
-                    _time.sleep(0.1)
-                else:
-                    now = _time.monotonic()
-                    if now - last_idle_refresh >= 1.0:
-                        last_idle_refresh = now
-                        self._invalidate(min_interval=1.0)
+                interval = self._periodic_tui_refresh_interval()
+                if interval is None:
                     _time.sleep(0.2)
+                    continue
+                self._invalidate(min_interval=interval)
+                _time.sleep(interval)
 
         spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
         spinner_thread.start()
-        
+
         # Background thread to process inputs and run agent
         def process_loop():
             while not self._should_exit:
