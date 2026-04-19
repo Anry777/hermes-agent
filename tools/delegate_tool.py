@@ -452,9 +452,25 @@ def _run_single_child(
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
             try:
-                leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, '_swap_credential'):
+                leased_entry = child_pool.entry_for_id(leased_cred_id)
+                if leased_entry is None:
+                    logger.warning(
+                        "Could not resolve leased credential '%s' for child; disabling child pool fallback",
+                        leased_cred_id,
+                    )
+                    child_pool.release_lease(leased_cred_id)
+                    leased_cred_id = None
+                    child._credential_pool = None
+                elif hasattr(child, '_swap_credential'):
                     child._swap_credential(leased_entry)
+                else:
+                    logger.warning(
+                        "Child agent cannot swap to leased credential '%s'; disabling child pool fallback",
+                        leased_cred_id,
+                    )
+                    child_pool.release_lease(leased_cred_id)
+                    leased_cred_id = None
+                    child._credential_pool = None
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 

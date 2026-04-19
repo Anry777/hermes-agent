@@ -728,6 +728,8 @@ class AIAgent:
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
+        _current_pool_entry = credential_pool.current() if credential_pool is not None else None
+        self._active_credential_id = getattr(_current_pool_entry, "id", None)
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -5273,6 +5275,7 @@ class AIAgent:
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        self._active_credential_id = getattr(entry, "id", None)
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
@@ -5322,6 +5325,7 @@ class AIAgent:
         pool = self._credential_pool
         if pool is None:
             return False, has_retried_429
+        active_credential_id = getattr(self, "_active_credential_id", None)
 
         effective_reason = classified_reason
         if effective_reason is None:
@@ -5334,7 +5338,11 @@ class AIAgent:
 
         if effective_reason == FailoverReason.billing:
             rotate_status = status_code if status_code is not None else 402
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+                credential_id=active_credential_id,
+            )
             if next_entry is not None:
                 logger.info(
                     "Credential %s (billing) — rotated to pool entry %s",
@@ -5349,7 +5357,11 @@ class AIAgent:
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+                credential_id=active_credential_id,
+            )
             if next_entry is not None:
                 logger.info(
                     "Credential %s (rate limit) — rotated to pool entry %s",
@@ -5361,7 +5373,7 @@ class AIAgent:
             return False, True
 
         if effective_reason == FailoverReason.auth:
-            refreshed = pool.try_refresh_current()
+            refreshed = pool.try_refresh_entry(active_credential_id)
             if refreshed is not None:
                 logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
                 self._swap_credential(refreshed)
@@ -5369,7 +5381,11 @@ class AIAgent:
             # Refresh failed — rotate to next credential instead of giving up.
             # The failed entry is already marked exhausted by try_refresh_current().
             rotate_status = status_code if status_code is not None else 401
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+                credential_id=active_credential_id,
+            )
             if next_entry is not None:
                 logger.info(
                     "Credential %s (auth refresh failed) — rotated to pool entry %s",
@@ -10914,6 +10930,12 @@ class AIAgent:
                     )
                 except Exception:
                     pass
+
+                if pool is not None:
+                    try:
+                        pool.record_success(getattr(self, "_active_credential_id", None))
+                    except Exception as exc:
+                        logger.debug("Failed to record credential pool success: %s", exc)
 
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
