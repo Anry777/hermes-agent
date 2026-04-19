@@ -60,6 +60,111 @@ def test_auth_add_api_key_persists_manual_entry(tmp_path, monkeypatch):
     assert entry["access_token"] == "sk-or-manual"
 
 
+def test_load_auth_store_falls_back_to_root_when_profile_auth_missing(tmp_path, monkeypatch):
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    (root_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "active_provider": "nous",
+        "providers": {
+            "nous": {"access_token": "root-token"},
+        },
+    }))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    from hermes_cli.auth import _load_auth_store
+
+    payload = _load_auth_store()
+    assert payload["active_provider"] == "nous"
+    assert payload["providers"]["nous"]["access_token"] == "root-token"
+
+
+def test_load_auth_store_keeps_two_profile_auth_stores_isolated(tmp_path, monkeypatch):
+    root_home = tmp_path / ".hermes"
+    profile_alpha = root_home / "profiles" / "alpha"
+    profile_beta = root_home / "profiles" / "beta"
+    profile_alpha.mkdir(parents=True, exist_ok=True)
+    profile_beta.mkdir(parents=True, exist_ok=True)
+    (profile_alpha / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "active_provider": "nous",
+        "providers": {
+            "nous": {"access_token": "alpha-token"},
+        },
+    }))
+    (profile_beta / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "active_provider": "nous",
+        "providers": {
+            "nous": {"access_token": "beta-token"},
+        },
+    }))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    from hermes_cli.auth import _load_auth_store
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_alpha))
+    alpha_payload = _load_auth_store()
+    assert alpha_payload["providers"]["nous"]["access_token"] == "alpha-token"
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_beta))
+    beta_payload = _load_auth_store()
+    assert beta_payload["providers"]["nous"]["access_token"] == "beta-token"
+
+
+def test_profile_first_auth_write_forks_from_root_without_mutating_root(tmp_path, monkeypatch):
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    root_payload = {
+        "version": 1,
+        "active_provider": "anthropic",
+        "providers": {
+            "anthropic": {"access_token": "root-token"},
+        },
+        "credential_pool": {
+            "anthropic": [
+                {
+                    "id": "cred-1",
+                    "label": "root-cred",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:hermes_pkce",
+                    "access_token": "pool-token",
+                }
+            ],
+            "openrouter": [
+                {
+                    "id": "cred-2",
+                    "label": "shared-other-provider",
+                    "auth_type": "api_key",
+                    "priority": 0,
+                    "source": "manual",
+                    "access_token": "sk-or-test",
+                }
+            ],
+        },
+    }
+    (root_home / "auth.json").write_text(json.dumps(root_payload, indent=2))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    from hermes_cli.auth import clear_provider_auth
+
+    assert clear_provider_auth("anthropic") is True
+
+    profile_payload = json.loads((profile_home / "auth.json").read_text())
+    assert profile_payload["active_provider"] is None
+    assert "anthropic" not in profile_payload.get("providers", {})
+    assert "anthropic" not in profile_payload.get("credential_pool", {})
+    assert "openrouter" in profile_payload.get("credential_pool", {})
+
+    root_after = json.loads((root_home / "auth.json").read_text())
+    assert root_after == root_payload
+
+
 def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

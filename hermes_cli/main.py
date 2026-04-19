@@ -271,7 +271,9 @@ def _has_any_provider_configured() -> bool:
         pass
 
     # Check for Nous Portal OAuth credentials
-    auth_file = get_hermes_home() / "auth.json"
+    from hermes_constants import resolve_auth_store_path
+
+    auth_file = resolve_auth_store_path()
     if auth_file.exists():
         try:
             import json

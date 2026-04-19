@@ -38,7 +38,7 @@ import httpx
 import yaml
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, resolve_auth_store_path
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +590,16 @@ def _auth_file_path() -> Path:
     return get_hermes_home() / "auth.json"
 
 
+def _auth_read_file_path() -> Path:
+    """Return the effective auth store path for reads.
+
+    Profiles read their own ``auth.json`` when present. If they do not have
+    one yet, fall back to the root/default auth store so profiles can reuse
+    the main login state without copying credentials up front.
+    """
+    return resolve_auth_store_path()
+
+
 def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
@@ -655,7 +665,7 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
-    auth_file = auth_file or _auth_file_path()
+    auth_file = auth_file or _auth_read_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 

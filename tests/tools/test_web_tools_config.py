@@ -160,6 +160,28 @@ class TestFirecrawlClientConfig:
             importlib.reload(tools.web_tools)
             assert tools.web_tools._read_nous_access_token() == "nous-token"
 
+    def test_nous_auth_token_falls_back_to_root_auth_when_profile_missing(self, tmp_path):
+        """Profiles without auth.json should reuse the root/default auth store."""
+        root_home = tmp_path / ".hermes"
+        profile_home = root_home / "profiles" / "coder"
+        profile_home.mkdir(parents=True, exist_ok=True)
+        (root_home / "auth.json").write_text(json.dumps({
+            "active_provider": "nous",
+            "providers": {
+                "nous": {
+                    "access_token": "root-nous-token",
+                    "expires_at": "2999-01-01T00:00:00Z",
+                }
+            }
+        }))
+
+        with patch("pathlib.Path.home", return_value=tmp_path), patch.dict(os.environ, {
+            "HERMES_HOME": str(profile_home),
+        }, clear=False):
+            import tools.web_tools
+            importlib.reload(tools.web_tools)
+            assert tools.web_tools._read_nous_access_token() == "root-nous-token"
+
     def test_check_auxiliary_model_re_resolves_backend_each_call(self):
         """Availability checks should not be pinned to module import state."""
         import tools.web_tools

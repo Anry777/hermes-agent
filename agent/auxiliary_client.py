@@ -46,8 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from agent.credential_pool import load_pool
-from hermes_cli.config import get_hermes_home
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, resolve_auth_store_path
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +188,6 @@ _NOUS_FREE_TIER_VISION_MODEL = "xiaomi/mimo-v2-omni"
 _NOUS_FREE_TIER_AUX_MODEL = "xiaomi/mimo-v2-pro"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-_AUTH_JSON_PATH = get_hermes_home() / "auth.json"
-
 # Codex fallback: uses the Responses API (the only endpoint the Codex
 # OAuth token can access) with a fast model for auxiliary tasks.
 # ChatGPT-backed Codex accounts currently reject gpt-5.3-codex for these
@@ -645,7 +642,7 @@ class AsyncAnthropicAuxiliaryClient:
 
 
 def _read_nous_auth() -> Optional[dict]:
-    """Read and validate ~/.hermes/auth.json for an active Nous provider.
+    """Read and validate the effective Hermes auth store for Nous.
 
     Returns the provider state dict if Nous is active with tokens,
     otherwise None.
@@ -667,9 +664,10 @@ def _read_nous_auth() -> Optional[dict]:
         }
 
     try:
-        if not _AUTH_JSON_PATH.is_file():
+        auth_path = resolve_auth_store_path()
+        if not auth_path.is_file():
             return None
-        data = json.loads(_AUTH_JSON_PATH.read_text())
+        data = json.loads(auth_path.read_text())
         if data.get("active_provider") != "nous":
             return None
         provider = data.get("providers", {}).get("nous", {})
@@ -693,33 +691,30 @@ def _nous_base_url() -> str:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
+    """Read a valid, non-expired Codex OAuth access token.
 
-    If a credential pool exists but currently has no selectable runtime entry
-    (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    Prefer the selected credential-pool entry. If no usable runtime entry is
+    available, fall back to the persisted Hermes auth store. The auth helpers
+    already resolve profile -> root-store fallback when needed.
     """
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        if token:
-            return token
+    _pool_present, entry = _select_pool_entry("openai-codex")
+    token = _pool_runtime_api_key(entry)
 
     try:
-        from hermes_cli.auth import _read_codex_tokens
-        data = _read_codex_tokens()
-        tokens = data.get("tokens", {})
-        access_token = tokens.get("access_token")
-        if not isinstance(access_token, str) or not access_token.strip():
+        if not token:
+            from hermes_cli.auth import _read_codex_tokens
+
+            data = _read_codex_tokens()
+            tokens = data.get("tokens", {}) if isinstance(data, dict) else {}
+            token = str(tokens.get("access_token", "") or "").strip()
+        if not token:
             return None
 
         # Check JWT expiry — expired tokens block the auto chain and
         # prevent fallback to working providers (e.g. Anthropic).
         try:
             import base64
-            payload = access_token.split(".")[1]
+            payload = token.split(".")[1]
             payload += "=" * (-len(payload) % 4)
             claims = json.loads(base64.urlsafe_b64decode(payload))
             exp = claims.get("exp", 0)
@@ -729,7 +724,7 @@ def _read_codex_access_token() -> Optional[str]:
         except Exception:
             pass  # Non-JWT token or decode error — use as-is
 
-        return access_token.strip()
+        return token.strip()
     except Exception as exc:
         logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
         return None

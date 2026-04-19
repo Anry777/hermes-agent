@@ -21,6 +21,7 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _try_payment_fallback,
     _resolve_auto,
+    _read_nous_auth,
 )
 
 
@@ -190,6 +191,32 @@ class TestReadCodexAccessToken:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         result = _read_codex_access_token()
         assert result == "plain-token-no-jwt"
+
+
+class TestReadNousAuth:
+    def test_falls_back_to_root_auth_when_profile_auth_missing(self, tmp_path, monkeypatch):
+        root_home = tmp_path / ".hermes"
+        profile_home = root_home / "profiles" / "coder"
+        profile_home.mkdir(parents=True, exist_ok=True)
+        (root_home / "auth.json").write_text(json.dumps({
+            "active_provider": "nous",
+            "providers": {
+                "nous": {
+                    "access_token": "root-nous-token",
+                    "agent_key": "root-agent-key",
+                    "inference_base_url": "https://inference.example/v1",
+                }
+            },
+        }))
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            provider = _read_nous_auth()
+
+        assert provider is not None
+        assert provider["access_token"] == "root-nous-token"
+        assert provider["agent_key"] == "root-agent-key"
 
 
 class TestAnthropicOAuthFlag:

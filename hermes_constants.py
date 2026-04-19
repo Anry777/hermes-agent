@@ -233,6 +233,28 @@ def get_config_path() -> Path:
     return get_hermes_home() / "config.yaml"
 
 
+def resolve_auth_store_path() -> Path:
+    """Return the effective ``auth.json`` path for reads.
+
+    In profile mode, prefer ``{HERMES_HOME}/auth.json`` when it exists.
+    If the active profile has no dedicated auth store yet, fall back to the
+    root/default profile auth store so profiles can reuse the main login.
+
+    Writes should still target ``get_hermes_home() / "auth.json"`` so a
+    profile can fork its own auth state the first time it mutates it.
+    """
+    current = get_hermes_home() / "auth.json"
+    if current.exists():
+        return current
+
+    default_root = get_default_hermes_root()
+    fallback = default_root / "auth.json"
+    if fallback != current and fallback.exists():
+        return fallback
+
+    return current
+
+
 def get_skills_dir() -> Path:
     """Return the path to the skills directory under HERMES_HOME."""
     return get_hermes_home() / "skills"
