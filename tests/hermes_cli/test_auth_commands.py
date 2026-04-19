@@ -716,6 +716,38 @@ def test_auth_list_prefers_explicit_reset_time(monkeypatch, capsys):
     assert "7d 0h left" in out
 
 
+def test_auth_list_shows_invalid_needs_relogin_reason(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_list_command
+
+    class _Entry:
+        id = "cred-1"
+        label = "workspace"
+        auth_type = "oauth"
+        source = "manual:device_code"
+        last_status = "invalid"
+        last_error_code = 402
+        last_error_reason = "deactivated_workspace"
+        last_error_message = "Workspace is deactivated."
+        last_status_at = 1000.0
+
+    class _Pool:
+        def entries(self):
+            return [_Entry()]
+
+        def peek(self):
+            return None
+
+    monkeypatch.setattr("hermes_cli.auth_commands.load_pool", lambda provider: _Pool())
+
+    class _Args:
+        provider = "openai-codex"
+
+    auth_list_command(_Args())
+
+    out = capsys.readouterr().out
+    assert "invalid deactivated_workspace (402) (needs_relogin)" in out
+
+
 def test_auth_remove_env_seeded_clears_env_var(tmp_path, monkeypatch):
     """Removing an env-seeded credential should also clear the env var from .env
     so the entry doesn't get re-seeded on the next load_pool() call."""

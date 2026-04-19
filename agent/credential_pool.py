@@ -49,6 +49,7 @@ def _load_config_safe() -> Optional[dict]:
 
 STATUS_OK = "ok"
 STATUS_EXHAUSTED = "exhausted"
+STATUS_INVALID = "invalid"
 
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
@@ -66,9 +67,9 @@ SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_LEAST_USED,
 }
 
-# Cooldown before retrying an exhausted credential.
-# 429 (rate-limited) and 402 (billing/quota) both cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# Cooldown before retrying a temporarily exhausted credential.
+# 429 (rate-limited) cools down for 1 hour by default unless the provider
+# supplied an explicit reset timestamp.
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 
@@ -192,6 +193,13 @@ def _exhausted_ttl(error_code: Optional[int]) -> int:
     if error_code == 429:
         return EXHAUSTED_TTL_429_SECONDS
     return EXHAUSTED_TTL_DEFAULT_SECONDS
+
+
+def _status_for_error_code(status_code: Optional[int]) -> str:
+    """Return the persisted pool status for a provider error."""
+    if status_code in (401, 402):
+        return STATUS_INVALID
+    return STATUS_EXHAUSTED
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -417,14 +425,16 @@ class CredentialPool:
         error_context: Optional[Dict[str, Any]] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
+        status = _status_for_error_code(status_code)
+        reset_at = normalized_error.get("reset_at") if status == STATUS_EXHAUSTED else None
         updated = replace(
             entry,
-            last_status=STATUS_EXHAUSTED,
+            last_status=status,
             last_status_at=time.time(),
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
+            last_error_reset_at=reset_at,
         )
         self._replace_entry(entry, updated)
         self._pending_round_robin_rotation.discard(entry.id)
@@ -702,6 +712,17 @@ class CredentialPool:
         cleared_any = False
         available: List[PooledCredential] = []
         for entry in self._entries:
+            if (
+                entry.last_status not in (STATUS_EXHAUSTED, STATUS_INVALID)
+                and entry.last_error_reset_at is not None
+            ):
+                # Legacy cleanup: older logic could leave "ok + reset_at"
+                # behind, which made auth.json look like a live cooldown even
+                # though selection ignored it. Drop the stale cooldown marker.
+                cleared = replace(entry, last_error_reset_at=None)
+                self._replace_entry(entry, cleared)
+                entry = cleared
+                cleared_any = True
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
             # by other processes (Claude Code CLI, other Hermes profiles).
@@ -711,6 +732,8 @@ class CredentialPool:
                 if synced is not entry:
                     entry = synced
                     cleared_any = True
+            if entry.last_status == STATUS_INVALID:
+                continue
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
@@ -917,7 +940,7 @@ class CredentialPool:
                 last_error_code=None,
                 last_error_reason=None,
                 last_error_message=None,
-                last_error_reset_at=entry.last_error_reset_at,
+                last_error_reset_at=None,
             )
             self._replace_entry(entry, updated)
 

@@ -1876,6 +1876,24 @@ class TestRunConversation:
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
 
+    def test_successful_response_records_credential_pool_success(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        pool = MagicMock()
+        agent._credential_pool = pool
+        agent._active_credential_id = "cred-devops"
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Done"
+        pool.record_success.assert_called_once_with("cred-devops")
+
     def test_interrupt_breaks_loop(self, agent):
         self._setup_agent(agent)
 
@@ -2899,6 +2917,37 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
+    def test_recover_with_pool_rotates_immediately_on_429_with_reset_at(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+        captured = {}
+
+        class _Pool:
+            def current(self):
+                return SimpleNamespace(label="primary")
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                captured["credential_id"] = credential_id
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-rate-reset"
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            error_context={"reason": "usage_limit_reached", "reset_at": 1776583642},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["status_code"] == 429
+        assert captured["error_context"]["reset_at"] == 1776583642
+        assert captured["credential_id"] == "cred-rate-reset"
+        agent._swap_credential.assert_called_once_with(next_entry)
+
 
     def test_recover_with_pool_refreshes_on_401(self, agent):
         """401 with successful refresh should swap to refreshed credential."""
@@ -2992,6 +3041,23 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "device_code_exhausted"
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
+
+    def test_extract_api_error_context_reads_detail_object_reason(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "detail": {
+                    "code": "deactivated_workspace",
+                    "message": "Workspace is deactivated.",
+                }
+            },
+            response=response,
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reason"] == "deactivated_workspace"
+        assert context["message"] == "Workspace is deactivated."
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
@@ -3413,6 +3479,8 @@ class TestFallbackAnthropicProvider:
         agent._fallback_model = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
+        agent._credential_pool = MagicMock()
+        agent._active_credential_id = "cred-primary"
 
         mock_client = MagicMock()
         mock_client.base_url = "https://openrouter.ai/api/v1"
@@ -3424,6 +3492,8 @@ class TestFallbackAnthropicProvider:
         assert result is True
         assert agent.api_mode == "chat_completions"
         assert agent.client is mock_client
+        assert agent._credential_pool is None
+        assert agent._active_credential_id is None
 
 
 def test_aiagent_uses_copilot_acp_client():

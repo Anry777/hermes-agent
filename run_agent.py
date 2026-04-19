@@ -2974,21 +2974,35 @@ class AIAgent:
         context: Dict[str, Any] = {}
 
         body = getattr(error, "body", None)
-        payload = None
+        payloads: list[dict[str, Any]] = []
         if isinstance(body, dict):
-            payload = body.get("error") if isinstance(body.get("error"), dict) else body
-        if isinstance(payload, dict):
-            reason = payload.get("code") or payload.get("error")
-            if isinstance(reason, str) and reason.strip():
-                context["reason"] = reason.strip()
-            message = payload.get("message") or payload.get("error_description")
-            if isinstance(message, str) and message.strip():
-                context["message"] = message.strip()
-            for key in ("resets_at", "reset_at"):
-                value = payload.get(key)
-                if value not in (None, ""):
-                    context["reset_at"] = value
-                    break
+            error_payload = body.get("error")
+            detail_payload = body.get("detail")
+            if isinstance(error_payload, dict):
+                payloads.append(error_payload)
+            if isinstance(detail_payload, dict):
+                payloads.append(detail_payload)
+            payloads.append(body)
+
+        for payload in payloads:
+            if "reason" not in context:
+                reason = payload.get("code") or payload.get("error") or payload.get("type")
+                if isinstance(reason, str) and reason.strip():
+                    context["reason"] = reason.strip()
+            if "message" not in context:
+                message = (
+                    payload.get("message")
+                    or payload.get("error_description")
+                    or payload.get("detail")
+                )
+                if isinstance(message, str) and message.strip():
+                    context["message"] = message.strip()
+            if "reset_at" not in context:
+                for key in ("resets_at", "reset_at"):
+                    value = payload.get(key)
+                    if value not in (None, ""):
+                        context["reset_at"] = value
+                        break
             retry_after = payload.get("retry_after")
             if retry_after not in (None, "") and "reset_at" not in context:
                 try:
@@ -5354,7 +5368,14 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
-            if not has_retried_429:
+            # Provider-supplied reset timestamps mean "this credential is
+            # unavailable until X", not "transient blip, retry immediately".
+            # Rotate right away so other pool entries get a chance.
+            has_provider_reset_at = (
+                isinstance(error_context, dict)
+                and error_context.get("reset_at") not in (None, "")
+            )
+            if not has_retried_429 and not has_provider_reset_at:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
             next_entry = pool.mark_exhausted_and_rotate(
@@ -6426,6 +6447,12 @@ class AIAgent:
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
             self._fallback_activated = True
+            # Fallback execution must not inherit the primary provider's
+            # credential pool state. Otherwise a successful fallback response
+            # can incorrectly record success against the original provider and
+            # clear its 429/401 status.
+            self._credential_pool = None
+            self._active_credential_id = None
 
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
@@ -10931,6 +10958,7 @@ class AIAgent:
                 except Exception:
                     pass
 
+                pool = self._credential_pool
                 if pool is not None:
                     try:
                         pool.record_success(getattr(self, "_active_credential_id", None))

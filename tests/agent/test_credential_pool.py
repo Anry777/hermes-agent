@@ -386,6 +386,143 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
     assert pool.select() is None
 
 
+def test_select_reenables_entry_after_reset_at_cooldown_expires(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    reset_at = 1_900_000_000
+    monkeypatch.setattr("agent.credential_pool.time.time", lambda: reset_at - 30)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "cooling-down",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "exhausted",
+                        "last_status_at": reset_at - 300,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_reset_at": reset_at,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    cooling = load_pool("openai-codex")
+    assert cooling.has_available() is False
+    assert cooling.select() is None
+
+    monkeypatch.setattr("agent.credential_pool.time.time", lambda: reset_at + 1)
+    reloaded = load_pool("openai-codex")
+    entry = reloaded.select()
+
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_status == "ok"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == "ok"
+    assert persisted["last_error_reset_at"] is None
+
+
+def test_record_success_clears_stale_reset_at(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "stale-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "ok",
+                        "last_status_at": None,
+                        "last_error_code": None,
+                        "last_error_reset_at": time.time() + 3600,
+                        "request_count": 1,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    updated = pool.record_success("cred-1")
+
+    assert updated is not None
+    assert updated.last_status == "ok"
+    assert updated.last_error_reset_at is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == "ok"
+    assert persisted["last_error_reset_at"] is None
+
+
+def test_select_cleans_legacy_ok_plus_reset_at(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "legacy-ok-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "ok",
+                        "last_error_reset_at": time.time() + 3600,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_error_reset_at is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_error_reset_at"] is None
+
+
 def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -427,8 +564,40 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     persisted = auth_payload["credential_pool"]["anthropic"][0]
-    assert persisted["last_status"] == "exhausted"
+    assert persisted["last_status"] == "invalid"
     assert persisted["last_error_code"] == 402
+
+
+def test_invalid_entry_is_never_reenabled_by_age(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "workspace-disabled",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "last_status": "invalid",
+                        "last_status_at": time.time() - 7 * 24 * 60 * 60,
+                        "last_error_code": 402,
+                        "last_error_reason": "deactivated_workspace",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.has_available() is False
+    assert pool.select() is None
 
 
 def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
