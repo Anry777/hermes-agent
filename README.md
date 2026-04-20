@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
   <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
   <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
 </p>
 
@@ -27,10 +27,26 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ---
 
+## Fork Notice
+
+This repository is a maintained fork of the original [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
+
+We forked it for a practical reason: the upstream project was inconvenient for our workflow in a few important places, and fixes we depended on were taking too long to land. This fork lets us ship those changes on our own schedule while continuing to build on the upstream Hermes codebase.
+
+Our maintenance policy is simple: after a new upstream Hermes release, we plan to rebase/update this fork within 2-3 days when there are no blocking conflicts. We intend to keep maintaining this fork until the fixes we rely on are available upstream and the original project becomes practical for our use again.
+
+### How This Fork Differs From Upstream
+
+- **Faster turnaround on fixes we need** without waiting for upstream review and release timing.
+- **Pragmatic local maintenance**: this fork exists primarily so we can apply and ship the changes that matter to our workflow first.
+- **A close upstream base**: we are not trying to replace Hermes with a radically different product, but to keep a working branch that stays compatible while evolving on our own schedule.
+
+If you need the exact code-level delta, the authoritative source is this repository's commit history relative to `NousResearch/hermes-agent`, not a static feature checklist in the README.
+
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Anry777/hermes-agent/prod/scripts/install.sh | bash
 ```
 
 Works on Linux, macOS, WSL2, and Android via Termux. The installer handles the platform-specific setup for you.
@@ -144,7 +160,7 @@ We welcome contributions! See the [Contributing Guide](https://hermes-agent.nous
 Quick start for contributors — clone and go with `setup-hermes.sh`:
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/Anry777/hermes-agent.git
 cd hermes-agent
 ./setup-hermes.sh     # installs uv, creates venv, installs .[all], symlinks ~/.local/bin/hermes
 ./hermes              # auto-detects the venv, no need to `source` first
@@ -172,8 +188,8 @@ python -m pytest tests/ -q
 
 - 💬 [Discord](https://discord.gg/NousResearch)
 - 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 💡 [Discussions](https://github.com/NousResearch/hermes-agent/discussions)
+- 🐛 [Issues](https://github.com/Anry777/hermes-agent/issues)
+- 💡 [Fork Repository](https://github.com/Anry777/hermes-agent)
 - 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
 
 ---
