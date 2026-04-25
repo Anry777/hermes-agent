@@ -8017,10 +8017,12 @@ class AIAgent:
                     codex_kwargs["tools"] = _ct_flush.convert_tools([memory_tool_def])
                 elif not codex_kwargs.get("tools"):
                     codex_kwargs["tools"] = [memory_tool_def]
-                if _flush_temperature is not None:
-                    codex_kwargs["temperature"] = _flush_temperature
-                else:
-                    codex_kwargs.pop("temperature", None)
+                # Codex/Responses fallback should preserve the transport's own
+                # request contract instead of re-injecting chat-style defaults.
+                # _build_api_kwargs() already chose the right fields for the
+                # active Responses backend; keep any preexisting temperature
+                # policy and only override the flush-specific token cap.
+                codex_kwargs.pop("temperature", None)
                 if "max_output_tokens" in codex_kwargs:
                     codex_kwargs["max_output_tokens"] = 5120
                 response = self._run_codex_stream(codex_kwargs)

@@ -325,5 +325,7 @@ class TestFlushMemoriesCodexFallback:
             agent.flush_memories(messages)
 
         mock_stream.assert_called_once()
+        codex_kwargs = mock_stream.call_args.args[0]
+        assert "temperature" not in codex_kwargs
         mock_memory.assert_called_once()
         assert mock_memory.call_args.kwargs["content"] == "Codex flush test"
