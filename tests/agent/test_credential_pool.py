@@ -131,9 +131,107 @@ def test_round_robin_strategy_rotates_priorities(tmp_path, monkeypatch):
     assert first.id == "cred-1"
 
     reloaded = load_pool("openrouter")
-    second = reloaded.select()
+    still_first = reloaded.select()
+    assert still_first is not None
+    assert still_first.id == "cred-1"
+
+    pool.record_success(first.id)
+
+    rotated = load_pool("openrouter")
+    second = rotated.select()
     assert second is not None
     assert second.id == "cred-2"
+
+
+def test_round_robin_does_not_rotate_while_lease_active(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                ]
+            },
+        },
+    )
+    config_path = tmp_path / "hermes" / "config.yaml"
+    config_path.write_text("credential_pool_strategies:\n  openrouter: round_robin\n")
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    leased_id = pool.acquire_lease()
+    assert leased_id == "cred-1"
+
+    pool.record_success(leased_id)
+
+    reloaded = load_pool("openrouter")
+    selected = reloaded.select()
+    assert selected is not None
+    assert selected.id == "cred-1"
+
+
+def test_round_robin_rotates_after_successful_leased_credential_is_released(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                ]
+            },
+        },
+    )
+    config_path = tmp_path / "hermes" / "config.yaml"
+    config_path.write_text("credential_pool_strategies:\n  openrouter: round_robin\n")
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    leased_id = pool.acquire_lease()
+    assert leased_id == "cred-1"
+
+    pool.record_success(leased_id)
+    pool.release_lease(leased_id)
+
+    reloaded = load_pool("openrouter")
+    selected = reloaded.select()
+    assert selected is not None
+    assert selected.id == "cred-2"
 
 
 def test_random_strategy_uses_random_choice(tmp_path, monkeypatch):
@@ -288,6 +386,143 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
     assert pool.select() is None
 
 
+def test_select_reenables_entry_after_reset_at_cooldown_expires(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    reset_at = 1_900_000_000
+    monkeypatch.setattr("agent.credential_pool.time.time", lambda: reset_at - 30)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "cooling-down",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "exhausted",
+                        "last_status_at": reset_at - 300,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_reset_at": reset_at,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    cooling = load_pool("openai-codex")
+    assert cooling.has_available() is False
+    assert cooling.select() is None
+
+    monkeypatch.setattr("agent.credential_pool.time.time", lambda: reset_at + 1)
+    reloaded = load_pool("openai-codex")
+    entry = reloaded.select()
+
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_status == "ok"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == "ok"
+    assert persisted["last_error_reset_at"] is None
+
+
+def test_record_success_clears_stale_reset_at(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "stale-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "ok",
+                        "last_status_at": None,
+                        "last_error_code": None,
+                        "last_error_reset_at": time.time() + 3600,
+                        "request_count": 1,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    updated = pool.record_success("cred-1")
+
+    assert updated is not None
+    assert updated.last_status == "ok"
+    assert updated.last_error_reset_at is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == "ok"
+    assert persisted["last_error_reset_at"] is None
+
+
+def test_select_cleans_legacy_ok_plus_reset_at(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "legacy-ok-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "ok",
+                        "last_error_reset_at": time.time() + 3600,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_error_reset_at is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_error_reset_at"] is None
+
+
 def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -329,8 +564,100 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     persisted = auth_payload["credential_pool"]["anthropic"][0]
-    assert persisted["last_status"] == "exhausted"
+    assert persisted["last_status"] == "invalid"
     assert persisted["last_error_code"] == 402
+
+
+def test_invalid_entry_is_never_reenabled_by_age(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "workspace-disabled",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "last_status": "invalid",
+                        "last_status_at": time.time() - 7 * 24 * 60 * 60,
+                        "last_error_code": 402,
+                        "last_error_reason": "deactivated_workspace",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.has_available() is False
+    assert pool.select() is None
+
+
+def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "access-old",
+                        "refresh_token": "refresh-old",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "access-other",
+                        "refresh_token": "refresh-other",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda access_token, refresh_token, timeout_seconds=20.0: {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+        },
+    )
+
+    pool = load_pool("openai-codex")
+    current = pool.select()
+    assert current.id == "cred-1"
+
+    refreshed = pool.try_refresh_current()
+
+    assert refreshed is not None
+    assert refreshed.access_token == "access-new"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    primary, secondary = auth_payload["credential_pool"]["openai-codex"]
+    assert primary["access_token"] == "access-new"
+    assert primary["refresh_token"] == "refresh-new"
+    assert secondary["access_token"] == "access-other"
+    assert secondary["refresh_token"] == "refresh-other"
 
 
 def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
@@ -646,6 +973,65 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     assert entry is not None
     assert entry.id == "key-b"
     assert entry.access_token == "sk-or-light"
+
+
+def test_least_used_strategy_updates_after_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy",
+        lambda _provider: "least_used",
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "first",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-a",
+                        "request_count": 0,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "second",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-or-b",
+                        "request_count": 1,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    first = pool.select()
+    assert first is not None
+    assert first.id == "key-a"
+
+    pool.record_success(first.id)
+    pool.record_success(first.id)
+
+    reloaded = load_pool("openrouter")
+    next_entry = reloaded.select()
+    assert next_entry is not None
+    assert next_entry.id == "key-b"
 
 
 def test_thread_safety_concurrent_select(tmp_path, monkeypatch):
@@ -989,6 +1375,98 @@ def test_release_lease_decrements_counter(tmp_path, monkeypatch):
 
     pool.release_lease("cred-1")
     assert pool._active_leases.get("cred-1", 0) == 0
+
+
+def test_mark_exhausted_and_rotate_unknown_credential_id_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    current = pool.select()
+    assert current is not None
+    assert current.id == "cred-1"
+
+    rotated = pool.mark_exhausted_and_rotate(status_code=429, credential_id="missing-cred")
+    assert rotated is None
+
+    reloaded = load_pool("openrouter")
+    entries = reloaded.entries()
+    assert [entry.id for entry in entries] == ["cred-1", "cred-2"]
+    assert entries[0].last_status is None
+
+
+def test_try_refresh_entry_unknown_credential_id_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "access-old",
+                        "refresh_token": "refresh-old",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda access_token, refresh_token, timeout_seconds=20.0: {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+        },
+    )
+
+    pool = load_pool("openai-codex")
+    refreshed = pool.try_refresh_entry("missing-cred")
+    assert refreshed is None
+
+    reloaded = load_pool("openai-codex")
+    entry = reloaded.select()
+    assert entry is not None
+    assert entry.access_token == "access-old"
 
 
 def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_path, monkeypatch):

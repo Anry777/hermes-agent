@@ -49,6 +49,7 @@ def _load_config_safe() -> Optional[dict]:
 
 STATUS_OK = "ok"
 STATUS_EXHAUSTED = "exhausted"
+STATUS_INVALID = "invalid"
 
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
@@ -66,9 +67,9 @@ SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_LEAST_USED,
 }
 
-# Cooldown before retrying an exhausted credential.
-# 429 (rate-limited) and 402 (billing/quota) both cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# Cooldown before retrying a temporarily exhausted credential.
+# 429 (rate-limited) cools down for 1 hour by default unless the provider
+# supplied an explicit reset timestamp.
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 
@@ -192,6 +193,13 @@ def _exhausted_ttl(error_code: Optional[int]) -> int:
     if error_code == 429:
         return EXHAUSTED_TTL_429_SECONDS
     return EXHAUSTED_TTL_DEFAULT_SECONDS
+
+
+def _status_for_error_code(status_code: Optional[int]) -> str:
+    """Return the persisted pool status for a provider error."""
+    if status_code in (401, 402):
+        return STATUS_INVALID
+    return STATUS_EXHAUSTED
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -368,6 +376,7 @@ class CredentialPool:
         self._strategy = get_pool_strategy(provider)
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
+        self._pending_round_robin_rotation: set[str] = set()
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
 
     def has_credentials(self) -> bool:
@@ -384,6 +393,17 @@ class CredentialPool:
         if not self._current_id:
             return None
         return next((entry for entry in self._entries if entry.id == self._current_id), None)
+
+    def entry_for_id(self, credential_id: Optional[str]) -> Optional[PooledCredential]:
+        if not credential_id:
+            return None
+        with self._lock:
+            return self._entry_for_id_unlocked(credential_id)
+
+    def _entry_for_id_unlocked(self, credential_id: Optional[str]) -> Optional[PooledCredential]:
+        if not credential_id:
+            return None
+        return next((entry for entry in self._entries if entry.id == credential_id), None)
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
@@ -405,16 +425,19 @@ class CredentialPool:
         error_context: Optional[Dict[str, Any]] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
+        status = _status_for_error_code(status_code)
+        reset_at = normalized_error.get("reset_at") if status == STATUS_EXHAUSTED else None
         updated = replace(
             entry,
-            last_status=STATUS_EXHAUSTED,
+            last_status=status,
             last_status_at=time.time(),
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
+            last_error_reset_at=reset_at,
         )
         self._replace_entry(entry, updated)
+        self._pending_round_robin_rotation.discard(entry.id)
         self._persist()
         return updated
 
@@ -767,6 +790,17 @@ class CredentialPool:
         cleared_any = False
         available: List[PooledCredential] = []
         for entry in self._entries:
+            if (
+                entry.last_status not in (STATUS_EXHAUSTED, STATUS_INVALID)
+                and entry.last_error_reset_at is not None
+            ):
+                # Legacy cleanup: older logic could leave "ok + reset_at"
+                # behind, which made auth.json look like a live cooldown even
+                # though selection ignored it. Drop the stale cooldown marker.
+                cleared = replace(entry, last_error_reset_at=None)
+                self._replace_entry(entry, cleared)
+                entry = cleared
+                cleared_any = True
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
             # by other processes (Claude Code CLI, other Hermes profiles).
@@ -787,6 +821,8 @@ class CredentialPool:
                 if synced is not entry:
                     entry = synced
                     cleared_any = True
+            if entry.last_status == STATUS_INVALID:
+                continue
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
@@ -814,6 +850,27 @@ class CredentialPool:
             self._persist()
         return available
 
+    def _pick_entry_unlocked(self, candidates: List[PooledCredential]) -> Optional[PooledCredential]:
+        if not candidates:
+            return None
+        if self._strategy == STRATEGY_RANDOM and len(candidates) > 1:
+            return random.choice(candidates)
+        if self._strategy == STRATEGY_LEAST_USED and len(candidates) > 1:
+            return min(candidates, key=lambda entry: (entry.request_count, entry.priority))
+        return min(candidates, key=lambda entry: entry.priority)
+
+    def _move_entry_to_end_unlocked(self, credential_id: str) -> Optional[PooledCredential]:
+        entry = self._entry_for_id_unlocked(credential_id)
+        if entry is None:
+            return None
+        rotated = [candidate for candidate in self._entries if candidate.id != credential_id]
+        rotated.append(entry)
+        self._entries = [
+            replace(candidate, priority=idx)
+            for idx, candidate in enumerate(rotated)
+        ]
+        return self._entry_for_id_unlocked(credential_id)
+
     def _select_unlocked(self) -> Optional[PooledCredential]:
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
@@ -821,29 +878,15 @@ class CredentialPool:
             logger.info("credential pool: no available entries (all exhausted or empty)")
             return None
 
-        if self._strategy == STRATEGY_RANDOM:
-            entry = random.choice(available)
-            self._current_id = entry.id
-            return entry
-
+        entry = self._pick_entry_unlocked(available)
+        if entry is None:
+            self._current_id = None
+            return None
         if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
-            entry = min(available, key=lambda e: e.request_count)
-            # Increment usage counter so subsequent selections distribute load
+            # Increment usage counter so subsequent selections distribute load.
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
-            self._current_id = entry.id
-            return updated
-
-        if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
-            entry = available[0]
-            rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
-            rotated.append(replace(entry, priority=len(self._entries) - 1))
-            self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist()
-            self._current_id = entry.id
-            return self.current() or entry
-
-        entry = available[0]
+            entry = updated
         self._current_id = entry.id
         return entry
 
@@ -859,9 +902,18 @@ class CredentialPool:
         *,
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
+        credential_id: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
-            entry = self.current() or self._select_unlocked()
+            entry = self._entry_for_id_unlocked(credential_id)
+            if credential_id and entry is None:
+                logger.warning(
+                    "credential pool: requested exhausted-mark for unknown credential_id=%s; skipping rotation",
+                    credential_id,
+                )
+                return None
+            if entry is None:
+                entry = self.current() or self._select_unlocked()
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
@@ -900,10 +952,14 @@ class CredentialPool:
                 if self._active_leases.get(entry.id, 0) < self._max_concurrent
             ]
             candidates = below_cap if below_cap else available
-            chosen = min(
-                candidates,
-                key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
-            )
+            min_leases = min(self._active_leases.get(entry.id, 0) for entry in candidates)
+            least_leased = [
+                entry for entry in candidates
+                if self._active_leases.get(entry.id, 0) == min_leases
+            ]
+            chosen = self._pick_entry_unlocked(least_leased)
+            if chosen is None:
+                return None
             self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
             self._current_id = chosen.id
             return chosen.id
@@ -914,21 +970,86 @@ class CredentialPool:
             count = self._active_leases.get(credential_id, 0)
             if count <= 1:
                 self._active_leases.pop(credential_id, None)
+                should_rotate = (
+                    credential_id in self._pending_round_robin_rotation
+                    and self._strategy == STRATEGY_ROUND_ROBIN
+                    and len(self._entries) > 1
+                )
+                if should_rotate:
+                    rotated = self._move_entry_to_end_unlocked(credential_id)
+                    self._pending_round_robin_rotation.discard(credential_id)
+                    if rotated is not None:
+                        self._persist()
+                else:
+                    self._pending_round_robin_rotation.discard(credential_id)
             else:
                 self._active_leases[credential_id] = count - 1
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
+        return self.try_refresh_entry()
+
+    def try_refresh_entry(self, credential_id: Optional[str] = None) -> Optional[PooledCredential]:
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            return self._try_refresh_entry_unlocked(credential_id)
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
-        entry = self.current()
+        return self._try_refresh_entry_unlocked(None)
+
+    def _try_refresh_entry_unlocked(self, credential_id: Optional[str] = None) -> Optional[PooledCredential]:
+        entry = self._entry_for_id_unlocked(credential_id)
+        if credential_id and entry is None:
+            logger.warning(
+                "credential pool: requested refresh for unknown credential_id=%s; skipping refresh",
+                credential_id,
+            )
+            return None
+        if entry is None:
+            entry = self.current()
         if entry is None:
             return None
         refreshed = self._refresh_entry(entry, force=True)
         if refreshed is not None:
             self._current_id = refreshed.id
         return refreshed
+
+    def record_success(self, credential_id: Optional[str] = None) -> Optional[PooledCredential]:
+        with self._lock:
+            entry = self._entry_for_id_unlocked(credential_id)
+            if credential_id and entry is None:
+                logger.warning(
+                    "credential pool: requested success-record for unknown credential_id=%s; skipping update",
+                    credential_id,
+                )
+                return None
+            if entry is None:
+                entry = self.current()
+            if entry is None:
+                return None
+
+            updated = replace(
+                entry,
+                request_count=max(0, int(entry.request_count or 0)) + 1,
+                last_status=STATUS_OK,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, updated)
+
+            should_rotate_round_robin = (
+                self._strategy == STRATEGY_ROUND_ROBIN
+                and len(self._entries) > 1
+            )
+            active_leases_for_entry = self._active_leases.get(updated.id, 0)
+            if should_rotate_round_robin and active_leases_for_entry > 0:
+                self._pending_round_robin_rotation.add(updated.id)
+            elif should_rotate_round_robin:
+                updated = self._move_entry_to_end_unlocked(updated.id) or updated
+
+            self._persist()
+            return updated
 
     def reset_statuses(self) -> int:
         count = 0

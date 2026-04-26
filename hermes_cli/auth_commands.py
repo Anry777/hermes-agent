@@ -15,6 +15,7 @@ from agent.credential_pool import (
     CUSTOM_POOL_PREFIX,
     SOURCE_MANUAL,
     STATUS_EXHAUSTED,
+    STATUS_INVALID,
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
@@ -130,6 +131,11 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
 
 
 def _format_exhausted_status(entry) -> str:
+    if entry.last_status == STATUS_INVALID:
+        reason = getattr(entry, "last_error_reason", None)
+        reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
+        code = f" ({entry.last_error_code})" if entry.last_error_code else ""
+        return f" invalid{reason_text}{code} (needs_relogin)"
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
     label, show_retry_window = _classify_exhausted_status(entry)

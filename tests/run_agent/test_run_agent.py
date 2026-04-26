@@ -2191,6 +2191,24 @@ class TestRunConversation:
         assert result["final_response"] == "Done searching"
         mock_print.assert_not_called()
 
+    def test_successful_response_records_credential_pool_success(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        pool = MagicMock()
+        agent._credential_pool = pool
+        agent._active_credential_id = "cred-devops"
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Done"
+        pool.record_success.assert_called_once_with("cred-devops")
+
     def test_interrupt_breaks_loop(self, agent):
         self._setup_agent(agent)
 
@@ -3220,12 +3238,14 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return current
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
                 assert status_code == 402
                 assert error_context is None
+                assert credential_id == "cred-primary"
                 return next_entry
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-primary"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3241,12 +3261,14 @@ class TestCredentialPoolRecovery:
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
+                assert credential_id == "cred-billing"
                 return next_entry
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-billing"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3267,12 +3289,14 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
                 assert status_code == 429
                 assert error_context is None
+                assert credential_id == "cred-rate"
                 return next_entry
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-rate"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3291,16 +3315,49 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
+    def test_recover_with_pool_rotates_immediately_on_429_with_reset_at(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+        captured = {}
+
+        class _Pool:
+            def current(self):
+                return SimpleNamespace(label="primary")
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                captured["credential_id"] = credential_id
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-rate-reset"
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            error_context={"reason": "usage_limit_reached", "reset_at": 1776583642},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["status_code"] == 429
+        assert captured["error_context"]["reset_at"] == 1776583642
+        assert captured["credential_id"] == "cred-rate-reset"
+        agent._swap_credential.assert_called_once_with(next_entry)
+
 
     def test_recover_with_pool_refreshes_on_401(self, agent):
         """401 with successful refresh should swap to refreshed credential."""
         refreshed_entry = SimpleNamespace(label="refreshed-primary", id="abc")
 
         class _Pool:
-            def try_refresh_current(self):
+            def try_refresh_entry(self, credential_id=None):
+                assert credential_id == "cred-auth"
                 return refreshed_entry
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-auth"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3316,15 +3373,18 @@ class TestCredentialPoolRecovery:
         next_entry = SimpleNamespace(label="secondary", id="def")
 
         class _Pool:
-            def try_refresh_current(self):
+            def try_refresh_entry(self, credential_id=None):
+                assert credential_id == "cred-auth-fail"
                 return None  # refresh failed
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
                 assert status_code == 401
                 assert error_context is None
+                assert credential_id == "cred-auth-fail"
                 return next_entry
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-auth-fail"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3340,14 +3400,17 @@ class TestCredentialPoolRecovery:
         """401 with failed refresh and no other credentials returns not recovered."""
 
         class _Pool:
-            def try_refresh_current(self):
+            def try_refresh_entry(self, credential_id=None):
+                assert credential_id == "cred-exhausted"
                 return None
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
                 assert error_context is None
+                assert credential_id == "cred-exhausted"
                 return None  # no more credentials
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-exhausted"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3377,6 +3440,23 @@ class TestCredentialPoolRecovery:
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
 
+    def test_extract_api_error_context_reads_detail_object_reason(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "detail": {
+                    "code": "deactivated_workspace",
+                    "message": "Workspace is deactivated.",
+                }
+            },
+            response=response,
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reason"] == "deactivated_workspace"
+        assert context["message"] == "Workspace is deactivated."
+
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
         captured = {}
@@ -3385,12 +3465,14 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, credential_id=None):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
+                captured["credential_id"] = credential_id
                 return next_entry
 
         agent._credential_pool = _Pool()
+        agent._active_credential_id = "cred-context"
         agent._swap_credential = MagicMock()
 
         recovered, retry_same = agent._recover_with_credential_pool(
@@ -3403,6 +3485,7 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         assert captured["status_code"] == 429
         assert captured["error_context"]["reason"] == "device_code_exhausted"
+        assert captured["credential_id"] == "cred-context"
 
 
 class TestMaxTokensParam:
@@ -3794,6 +3877,8 @@ class TestFallbackAnthropicProvider:
         agent._fallback_model = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
+        agent._credential_pool = MagicMock()
+        agent._active_credential_id = "cred-primary"
 
         mock_client = MagicMock()
         mock_client.base_url = "https://openrouter.ai/api/v1"
@@ -3805,6 +3890,8 @@ class TestFallbackAnthropicProvider:
         assert result is True
         assert agent.api_mode == "chat_completions"
         assert agent.client is mock_client
+        assert agent._credential_pool is None
+        assert agent._active_credential_id is None
 
 
 def test_aiagent_uses_copilot_acp_client():
