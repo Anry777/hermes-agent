@@ -11,13 +11,16 @@ Official MAX Bot API semantics used here:
 - outbound text messages use POST /messages;
 - explicit dev/test polling uses GET /updates;
 - bot token is sent in the Authorization header;
-- text payload uses NewMessageBody fields, with a 4000-character text limit.
+- text payload uses NewMessageBody fields, with a 4000-character text limit;
+- inbound image attachments are mapped from MessageBody.attachments and cached
+  locally before dispatch so Hermes vision tools can read stable file paths.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import re
 from datetime import datetime
@@ -35,7 +38,13 @@ except ImportError:  # pragma: no cover - dependency is installed in normal Herm
     AIOHTTP_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_image_from_url,
+)
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.session import SessionSource
 
@@ -437,7 +446,28 @@ class MaxAdapter(BasePlatformAdapter):
         dedup_key = self._dedup_key(update, event)
         if self._dedup.is_duplicate(dedup_key):
             return
+        await self._cache_image_media(event)
         await self.handle_message(event)
+
+    async def _cache_image_media(self, event: MessageEvent) -> None:
+        if not event.media_urls:
+            return
+        cached_urls: list[str] = []
+        for i, url in enumerate(event.media_urls):
+            media_type = event.media_types[i] if i < len(event.media_types) else ""
+            if not (media_type.startswith("image/") or event.message_type == MessageType.PHOTO):
+                cached_urls.append(url)
+                continue
+            try:
+                cached_urls.append(await cache_image_from_url(url, ext=self._image_ext(url, media_type)))
+            except Exception as exc:
+                logger.warning(
+                    "[MAX] Failed to cache MAX image attachment %s: %s",
+                    url,
+                    exc,
+                )
+                cached_urls.append(url)
+        event.media_urls = cached_urls
 
     def _update_to_event(self, update: Dict[str, Any]) -> Optional[MessageEvent]:
         if update.get("update_type") != "message_created":
@@ -450,7 +480,9 @@ class MaxAdapter(BasePlatformAdapter):
             return None
         body = message.get("body") if isinstance(message.get("body"), dict) else {}
         text = body.get("text")
-        if not isinstance(text, str) or not text.strip():
+        text = text if isinstance(text, str) else ""
+        media_urls, media_types = self._extract_image_media(body)
+        if not text.strip() and not media_urls:
             return None
         recipient = message.get("recipient") if isinstance(message.get("recipient"), dict) else {}
         chat_id = self._chat_id(sender, recipient)
@@ -469,12 +501,128 @@ class MaxAdapter(BasePlatformAdapter):
         timestamp = self._timestamp(update, message)
         return MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
             source=source,
             raw_message=update,
             message_id=message_id,
             timestamp=timestamp,
+            media_urls=media_urls,
+            media_types=media_types,
         )
+
+    @classmethod
+    def _extract_image_media(cls, body: Dict[str, Any]) -> tuple[list[str], list[str]]:
+        attachments = body.get("attachments")
+        if not isinstance(attachments, list):
+            return [], []
+        urls: list[str] = []
+        media_types: list[str] = []
+        seen: set[str] = set()
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            payload = attachment.get("payload") if isinstance(attachment.get("payload"), dict) else {}
+            att_type = _as_str(_first_present(attachment, "type", "attachment_type")).lower().strip()
+            mime = cls._image_mime(attachment, payload)
+            candidates = cls._image_url_candidates(attachment, payload)
+            if not candidates:
+                continue
+            if att_type not in {"image", "photo"} and not mime.startswith("image/"):
+                # Be tolerant of payload-only MAX shapes, but do not treat arbitrary
+                # files as images unless the type/mime or URL extension says so.
+                candidates = [url for url in candidates if cls._image_mime_from_url(url).startswith("image/")]
+            for url in candidates:
+                if url in seen:
+                    continue
+                inferred_mime = mime or cls._image_mime_from_url(url)
+                if not inferred_mime and att_type in {"image", "photo"}:
+                    inferred_mime = "image/jpeg"
+                if not inferred_mime.startswith("image/"):
+                    continue
+                seen.add(url)
+                urls.append(url)
+                media_types.append(inferred_mime)
+        return urls, media_types
+
+    @classmethod
+    def _image_url_candidates(cls, attachment: Dict[str, Any], payload: Dict[str, Any]) -> list[str]:
+        direct: list[str] = []
+        for container in (attachment, payload):
+            value = _first_present(container, "url", "download_url", "downloadUrl", "image_url", "imageUrl")
+            if isinstance(value, str) and value.strip():
+                direct.append(value.strip())
+            values = _first_present(container, "urls", "download_urls", "downloadUrls")
+            if isinstance(values, list):
+                direct.extend(str(item).strip() for item in values if str(item).strip())
+        photo_url = cls._best_photo_url(payload.get("photos"))
+        if photo_url:
+            direct.append(photo_url)
+        return direct
+
+    @classmethod
+    def _best_photo_url(cls, photos: Any) -> str:
+        candidates: list[tuple[int, str]] = []
+        if isinstance(photos, dict):
+            if isinstance(photos.get("url"), str):
+                candidates.append((cls._photo_score(photos), photos["url"].strip()))
+            else:
+                for key, value in photos.items():
+                    score_hint = cls._safe_int(key, 0)
+                    if isinstance(value, str):
+                        candidates.append((score_hint, value.strip()))
+                    elif isinstance(value, dict):
+                        url = _first_present(value, "url", "download_url", "downloadUrl", "image_url", "imageUrl")
+                        if isinstance(url, str) and url.strip():
+                            candidates.append((max(cls._photo_score(value), score_hint), url.strip()))
+        elif isinstance(photos, list):
+            for value in photos:
+                if isinstance(value, str):
+                    candidates.append((0, value.strip()))
+                elif isinstance(value, dict):
+                    url = _first_present(value, "url", "download_url", "downloadUrl", "image_url", "imageUrl")
+                    if isinstance(url, str) and url.strip():
+                        candidates.append((cls._photo_score(value), url.strip()))
+        if not candidates:
+            return ""
+        return max(candidates, key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _photo_score(photo: Dict[str, Any]) -> int:
+        width = MaxAdapter._safe_int(_first_present(photo, "width", "w"), 0)
+        height = MaxAdapter._safe_int(_first_present(photo, "height", "h"), 0)
+        if width and height:
+            return width * height
+        return max(width, height)
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _image_mime(attachment: Dict[str, Any], payload: Dict[str, Any]) -> str:
+        for container in (attachment, payload):
+            value = _first_present(container, "mime_type", "mimeType", "content_type", "contentType")
+            if isinstance(value, str) and value.lower().startswith("image/"):
+                return value.lower()
+        return ""
+
+    @staticmethod
+    def _image_mime_from_url(url: str) -> str:
+        guessed, _ = mimetypes.guess_type(urlparse(url).path)
+        if guessed and guessed.lower().startswith("image/"):
+            return guessed.lower()
+        return ""
+
+    @staticmethod
+    def _image_ext(url: str, mime: str) -> str:
+        path_ext = os.path.splitext(urlparse(url).path)[1].lower()
+        if path_ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+            return path_ext
+        guessed = mimetypes.guess_extension(mime or "")
+        return guessed or ".jpg"
 
     def _is_own_message(self, sender: Dict[str, Any]) -> bool:
         sender_id = _as_str(sender.get("user_id") or sender.get("id")).strip()

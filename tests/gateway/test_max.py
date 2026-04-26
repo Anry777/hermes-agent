@@ -76,7 +76,17 @@ def _make_adapter(token="max-token", **extra):
     return MaxAdapter(PlatformConfig(enabled=True, token=token, extra=extra))
 
 
-def _message_update(text="hello MAX", *, update_id="upd-1", sender_id=123, chat_id=777):
+def _message_update(
+    text="hello MAX",
+    *,
+    update_id="upd-1",
+    sender_id=123,
+    chat_id=777,
+    attachments=None,
+):
+    body = {"text": text}
+    if attachments is not None:
+        body["attachments"] = attachments
     return {
         "update_id": update_id,
         "update_type": "message_created",
@@ -85,7 +95,7 @@ def _message_update(text="hello MAX", *, update_id="upd-1", sender_id=123, chat_
             "sender": {"user_id": sender_id, "first_name": "Alice", "username": "alice", "is_bot": False},
             "recipient": {"chat_id": chat_id, "type": "chat", "title": "Ops"},
             "timestamp": 1710000000,
-            "body": {"text": text},
+            "body": body,
         },
     }
 
@@ -346,6 +356,107 @@ class TestMaxAdapter:
         assert event.source.chat_name == "Ops"
         assert event.source.user_id == "123"
         assert event.source.user_name == "Alice"
+
+    def test_message_created_update_converts_image_attachment_url_to_photo_event(self):
+        adapter = _make_adapter(bot_user_id="999")
+        update = _message_update(
+            text="what is this?",
+            attachments=[
+                {
+                    "type": "image",
+                    "payload": {
+                        "url": "https://cdn.example.com/photo.jpg",
+                    },
+                }
+            ],
+        )
+
+        event = adapter._update_to_event(update)
+
+        assert event is not None
+        assert event.text == "what is this?"
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls == ["https://cdn.example.com/photo.jpg"]
+        assert event.media_types == ["image/jpeg"]
+
+    def test_message_created_update_accepts_image_only_messages(self):
+        adapter = _make_adapter(bot_user_id="999")
+        update = _message_update(
+            text="",
+            attachments=[
+                {
+                    "type": "image",
+                    "payload": {
+                        "photos": {
+                            "128": {"url": "https://cdn.example.com/small.webp", "width": 128, "height": 128},
+                            "1024": {"url": "https://cdn.example.com/large.webp", "width": 1024, "height": 768},
+                        }
+                    },
+                }
+            ],
+        )
+
+        event = adapter._update_to_event(update)
+
+        assert event is not None
+        assert event.text == ""
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls == ["https://cdn.example.com/large.webp"]
+        assert event.media_types == ["image/webp"]
+
+    @pytest.mark.asyncio
+    async def test_handle_update_caches_image_attachment_before_dispatch(self):
+        adapter = _make_adapter(bot_user_id="999")
+        calls = []
+
+        async def handler(event):
+            calls.append(event)
+
+        adapter.set_message_handler(handler)
+        update = _message_update(
+            text="describe",
+            attachments=[{"type": "image", "payload": {"url": "https://cdn.example.com/photo.png"}}],
+        )
+
+        with patch(
+            "gateway.platforms.max.cache_image_from_url",
+            new_callable=AsyncMock,
+            return_value="/tmp/max_cached_photo.png",
+        ) as cache:
+            await adapter._handle_update(update)
+            await _drain_adapter_tasks(adapter)
+
+        cache.assert_awaited_once_with("https://cdn.example.com/photo.png", ext=".png")
+        assert len(calls) == 1
+        assert calls[0].message_type == MessageType.PHOTO
+        assert calls[0].media_urls == ["/tmp/max_cached_photo.png"]
+        assert calls[0].media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_handle_update_keeps_original_image_url_when_cache_fails(self, caplog):
+        adapter = _make_adapter(bot_user_id="999")
+        calls = []
+
+        async def handler(event):
+            calls.append(event)
+
+        adapter.set_message_handler(handler)
+        update = _message_update(
+            text="describe",
+            attachments=[{"type": "image", "payload": {"url": "https://cdn.example.com/photo.png"}}],
+        )
+
+        with patch(
+            "gateway.platforms.max.cache_image_from_url",
+            new_callable=AsyncMock,
+            side_effect=ValueError("blocked"),
+        ):
+            await adapter._handle_update(update)
+            await _drain_adapter_tasks(adapter)
+
+        assert len(calls) == 1
+        assert calls[0].media_urls == ["https://cdn.example.com/photo.png"]
+        assert "Failed to cache MAX image attachment" in caplog.text
 
     @pytest.mark.asyncio
     async def test_webhook_requires_x_max_bot_api_secret_when_configured_and_acks_quickly(self):
