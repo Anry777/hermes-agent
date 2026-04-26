@@ -1,6 +1,6 @@
 """MAX messenger platform adapter.
 
-Webhook-first, text-only MAX Bot API integration for Hermes gateway.
+Webhook-first MAX Bot API integration for Hermes gateway.
 An explicit MAX_TRANSPORT=polling mode is available for local development/testing
 without a public HTTPS URL; webhook remains the production default.
 
@@ -9,6 +9,8 @@ Official MAX Bot API semantics used here:
 - MAX sends each webhook as an HTTPS POST containing an Update object;
 - webhook secrets are verified through X-Max-Bot-Api-Secret;
 - outbound text messages use POST /messages;
+- outbound image messages use POST /uploads?type=image, multipart upload field
+  data, then POST /messages with an image attachment;
 - explicit dev/test polling uses GET /updates;
 - bot token is sent in the Authorization header;
 - text payload uses NewMessageBody fields, with a 4000-character text limit;
@@ -393,29 +395,161 @@ class MaxAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
         last_result: Optional[SendResult] = None
         for chunk in chunks:
-            params = self._target_params(chat_id, metadata)
-            body: Dict[str, Any] = {"text": chunk}
-            if reply_to:
-                body["link"] = {"type": "reply", "mid": reply_to}
-            if "notify" in metadata:
-                body["notify"] = bool(metadata["notify"])
-            if metadata.get("format"):
-                body["format"] = metadata["format"]
+            body = self._message_body(text=chunk, reply_to=reply_to, metadata=metadata)
+            last_result = await self._post_message_body(chat_id, body, metadata)
+            if not last_result.success:
+                return last_result
+        return last_result or SendResult(success=False, error="No MAX message chunks were sent")
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Download a remote image safely, upload it to MAX, and send it natively."""
+        if not self.token:
+            return SendResult(success=False, error="MAX_BOT_TOKEN is not configured")
+        try:
+            image_path = await cache_image_from_url(image_url)
+        except Exception as exc:
+            return SendResult(success=False, error=f"Failed to cache MAX image URL: {exc}", retryable=True)
+        return await self.send_image_file(
+            chat_id=chat_id,
+            image_path=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a local image file to MAX and send it as an image attachment."""
+        metadata = metadata or {}
+        if not self.token:
+            return SendResult(success=False, error="MAX_BOT_TOKEN is not configured")
+        path = os.path.expanduser(str(image_path or ""))
+        if not path or not os.path.isfile(path):
+            return SendResult(success=False, error=f"MAX image file does not exist: {image_path}")
+        try:
+            upload_payload = await self._upload_media_file(path, upload_type="image")
+            body = self._message_body(text=caption or None, reply_to=reply_to, metadata=metadata)
+            body["attachments"] = [{"type": "image", "payload": upload_payload}]
+            return await self._post_message_body(chat_id, body, metadata, retry_attachment_not_ready=True)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def _upload_media_file(self, file_path: str, *, upload_type: str) -> Dict[str, Any]:
+        response = await self._get_client().post(
+            f"{self.base_url}/uploads",
+            params={"type": upload_type},
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        upload_info = response.json()
+        upload_url = self._extract_upload_url(upload_info)
+        if not upload_url:
+            raise ValueError("MAX upload endpoint did not return an upload URL")
+
+        filename = os.path.basename(file_path)
+        mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        with open(file_path, "rb") as file_obj:
+            upload_response = await self._get_client().post(
+                upload_url,
+                files={"data": (filename, file_obj, mime_type)},
+                headers={"Authorization": self.token},
+            )
+        upload_response.raise_for_status()
+        upload_payload = upload_response.json()
+        if not isinstance(upload_payload, dict):
+            raise ValueError("MAX upload response was not a JSON object")
+        return upload_payload
+
+    @staticmethod
+    def _extract_upload_url(payload: Any) -> str:
+        if isinstance(payload, str):
+            return payload.strip()
+        if not isinstance(payload, dict):
+            return ""
+        value = _first_present(payload, "url", "upload_url", "uploadUrl", "href")
+        return _as_str(value).strip() if value is not None else ""
+
+    def _message_body(
+        self,
+        *,
+        text: Optional[str],
+        reply_to: Optional[str],
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        if text:
+            body["text"] = text
+        if reply_to:
+            body["link"] = {"type": "reply", "mid": reply_to}
+        if "notify" in metadata:
+            body["notify"] = bool(metadata["notify"])
+        if metadata.get("format"):
+            body["format"] = metadata["format"]
+        return body
+
+    async def _post_message_body(
+        self,
+        chat_id: str,
+        body: Dict[str, Any],
+        metadata: Dict[str, Any],
+        *,
+        retry_attachment_not_ready: bool = False,
+    ) -> SendResult:
+        delays = (0.5, 1.0, 2.0) if retry_attachment_not_ready else ()
+        attempts = len(delays) + 1
+        for attempt in range(attempts):
             try:
                 response = await self._get_client().post(
                     f"{self.base_url}/messages",
-                    params=params,
+                    params=self._target_params(chat_id, metadata),
                     json=body,
                     headers=self._headers(),
                 )
+                if self._is_attachment_not_ready_response(response) and attempt < len(delays):
+                    await asyncio.sleep(delays[attempt])
+                    continue
                 response.raise_for_status()
                 payload = response.json()
             except Exception as exc:
                 return SendResult(success=False, error=str(exc), retryable=True)
+            return SendResult(success=True, message_id=self._extract_message_id(payload), raw_response=payload)
+        return SendResult(success=False, error="MAX attachment was not ready after retries", retryable=True)
 
-            message_id = self._extract_message_id(payload)
-            last_result = SendResult(success=True, message_id=message_id, raw_response=payload)
-        return last_result or SendResult(success=False, error="No MAX message chunks were sent")
+    @classmethod
+    def _is_attachment_not_ready_response(cls, response: Any) -> bool:
+        status_code = getattr(response, "status_code", 200)
+        if status_code < 400:
+            return False
+        payload: Any = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = getattr(response, "text", "")
+        return cls._contains_attachment_not_ready(payload)
+
+    @classmethod
+    def _contains_attachment_not_ready(cls, value: Any) -> bool:
+        if isinstance(value, str):
+            return "attachment.not.ready" in value
+        if isinstance(value, dict):
+            return any(cls._contains_attachment_not_ready(item) for item in value.values())
+        if isinstance(value, list):
+            return any(cls._contains_attachment_not_ready(item) for item in value)
+        return False
 
     @staticmethod
     def _target_params(target: str, metadata: Dict[str, Any]) -> Dict[str, str]:

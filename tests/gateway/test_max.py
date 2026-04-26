@@ -29,16 +29,33 @@ class FakeResponse:
 
 
 class RecordingClient:
-    def __init__(self, *, get_responses=None):
+    def __init__(self, *, get_responses=None, post_responses=None):
         self.posts = []
         self.gets = []
         self.closed = False
         self._get_responses = list(get_responses or [])
+        self._post_responses = list(post_responses or [])
 
-    async def post(self, url, *, params=None, json=None, headers=None):
-        self.posts.append({"url": url, "params": params or {}, "json": json or {}, "headers": headers or {}})
+    async def post(self, url, *, params=None, json=None, headers=None, data=None, files=None, **kwargs):
+        call = {"url": url, "params": params or {}, "json": json or {}, "headers": headers or {}}
+        if data is not None:
+            call["data"] = data
+        if files is not None:
+            call["files"] = files
+        if kwargs:
+            call["kwargs"] = kwargs
+        self.posts.append(call)
+        if self._post_responses:
+            response = self._post_responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
         if url.endswith("/subscriptions"):
             return FakeResponse({"success": True})
+        if url.endswith("/uploads"):
+            return FakeResponse({"url": "https://upload.max.example/image"})
+        if url.startswith("https://upload.max.example/"):
+            return FakeResponse({"token": f"uploaded-{len(self.posts)}"})
         return FakeResponse({"message": {"id": f"msg-{len(self.posts)}"}})
 
     async def get(self, url, *, params=None, headers=None, timeout=None):
@@ -342,6 +359,128 @@ class TestMaxAdapter:
         assert len(client.posts) == 2
         assert all(len(call["json"]["text"]) <= 4000 for call in client.posts)
 
+    @pytest.mark.asyncio
+    async def test_send_image_file_uploads_file_and_sends_image_attachment_with_caption(self, tmp_path):
+        image_path = tmp_path / "cat.png"
+        image_path.write_bytes(b"fake png bytes")
+        upload_payload = {"token": "uploaded-image", "photos": {"1024": {"url": "https://cdn.max/cat.png"}}}
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient(post_responses=[
+            FakeResponse({"url": "https://upload.max.example/image-1"}),
+            FakeResponse(upload_payload),
+            FakeResponse({"message": {"mid": "msg-image"}}),
+        ])
+        adapter._client = client
+
+        result = await adapter.send_image_file(
+            "777",
+            str(image_path),
+            caption="cat caption",
+            metadata={"target_type": "chat", "notify": False},
+        )
+
+        assert result.success is True
+        assert result.message_id == "msg-image"
+        assert client.posts[0] == {
+            "url": "https://platform-api.max.ru/uploads",
+            "params": {"type": "image"},
+            "json": {},
+            "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
+        }
+        assert client.posts[1]["url"] == "https://upload.max.example/image-1"
+        assert client.posts[1]["headers"] == {"Authorization": "max-token"}
+        assert "data" in client.posts[1]["files"]
+        assert client.posts[2] == {
+            "url": "https://platform-api.max.ru/messages",
+            "params": {"chat_id": "777"},
+            "json": {
+                "text": "cat caption",
+                "notify": False,
+                "attachments": [{"type": "image", "payload": upload_payload}],
+            },
+            "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_allows_attachment_without_caption(self, tmp_path):
+        image_path = tmp_path / "cat.jpg"
+        image_path.write_bytes(b"fake jpg bytes")
+        upload_payload = {"token": "uploaded-image"}
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient(post_responses=[
+            FakeResponse({"upload_url": "https://upload.max.example/image-2"}),
+            FakeResponse(upload_payload),
+            FakeResponse({"message": {"id": "msg-no-caption"}}),
+        ])
+        adapter._client = client
+
+        result = await adapter.send_image_file("777", str(image_path))
+
+        assert result.success is True
+        assert result.message_id == "msg-no-caption"
+        assert client.posts[2]["json"] == {"attachments": [{"type": "image", "payload": upload_payload}]}
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_retries_when_attachment_is_not_ready(self, tmp_path):
+        image_path = tmp_path / "cat.webp"
+        image_path.write_bytes(b"fake webp bytes")
+        upload_payload = {"token": "uploaded-image"}
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient(post_responses=[
+            FakeResponse({"url": "https://upload.max.example/image-3"}),
+            FakeResponse(upload_payload),
+            FakeResponse({"code": "attachment.not.ready", "message": "attachment is not ready"}, status_code=400),
+            FakeResponse({"message": {"id": "msg-after-retry"}}),
+        ])
+        adapter._client = client
+
+        with patch("gateway.platforms.max.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            result = await adapter.send_image_file("777", str(image_path), caption="retry me")
+
+        assert result.success is True
+        assert result.message_id == "msg-after-retry"
+        assert client.posts[2]["json"] == client.posts[3]["json"]
+        sleep.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_missing_local_file_fails_without_http_calls(self, tmp_path):
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient()
+        adapter._client = client
+
+        result = await adapter.send_image_file("777", str(tmp_path / "missing.png"))
+
+        assert result.success is False
+        assert "does not exist" in result.error
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_send_image_url_downloads_through_safe_cache_before_max_upload(self, tmp_path):
+        image_path = tmp_path / "remote.png"
+        image_path.write_bytes(b"fake remote png bytes")
+        upload_payload = {"token": "uploaded-image"}
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient(post_responses=[
+            FakeResponse({"url": "https://upload.max.example/image-4"}),
+            FakeResponse(upload_payload),
+            FakeResponse({"message": {"id": "msg-remote"}}),
+        ])
+        adapter._client = client
+
+        with patch(
+            "gateway.platforms.max.cache_image_from_url",
+            new_callable=AsyncMock,
+            return_value=str(image_path),
+        ) as cache:
+            result = await adapter.send_image("777", "https://cdn.example.com/remote.png", caption="remote")
+
+        assert result.success is True
+        cache.assert_awaited_once_with("https://cdn.example.com/remote.png")
+        assert client.posts[2]["json"] == {
+            "text": "remote",
+            "attachments": [{"type": "image", "payload": upload_payload}],
+        }
+
     def test_message_created_update_converts_official_message_body_to_event(self):
         adapter = _make_adapter(bot_user_id="999")
 
@@ -503,6 +642,17 @@ class TestMaxAdapter:
         await _drain_adapter_tasks(adapter)
 
         assert calls == ["dedup me"]
+
+
+class TestMaxPromptHints:
+    def test_max_platform_hint_advertises_native_image_media_delivery(self):
+        from agent.prompt_builder import PLATFORM_HINTS
+
+        hint = PLATFORM_HINTS["max"]
+
+        assert "MEDIA:/absolute/path/to/file" in hint
+        assert "Images" in hint
+        assert "native" in hint
 
 
 class TestMaxSendMessageToolIntegration:
