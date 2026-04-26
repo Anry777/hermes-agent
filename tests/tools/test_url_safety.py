@@ -169,6 +169,22 @@ class TestIsSafeUrl:
         ]):
             assert is_safe_url("https://multimedia.nt.qq.com.cn/download?id=123") is True
 
+    def test_max_oneme_image_hostname_allowed_with_benchmark_ip(self):
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("198.18.17.74", 0)),
+        ]):
+            assert is_safe_url("https://i.oneme.ru/i?r=photo-token") is True
+
+    @pytest.mark.parametrize("url", [
+        "https://sub.i.oneme.ru/i?r=photo-token",
+        "http://i.oneme.ru/i?r=photo-token",
+    ])
+    def test_max_oneme_image_hostname_exception_is_exact_https_match(self, url):
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("198.18.17.74", 0)),
+        ]):
+            assert is_safe_url(url) is False
+
     def test_qq_multimedia_hostname_exception_is_exact_match(self):
         with patch("socket.getaddrinfo", return_value=[
             (2, 1, 6, "", ("198.18.0.23", 0)),

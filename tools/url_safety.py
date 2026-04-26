@@ -55,10 +55,12 @@ _ALWAYS_BLOCKED_NETWORKS = (
 )
 
 # Exact HTTPS hostnames allowed to resolve to private/benchmark-space IPs.
-# This is intentionally narrow: QQ media downloads can legitimately resolve
-# to 198.18.0.0/15 behind local proxy/benchmark infrastructure.
+# This is intentionally narrow: some messenger CDN media hosts legitimately
+# resolve to 198.18.0.0/15 behind local proxy/benchmark infrastructure.
+# Keep this as exact hostnames only; do not allow wildcard subdomains.
 _TRUSTED_PRIVATE_IP_HOSTS = frozenset({
     "multimedia.nt.qq.com.cn",
+    "i.oneme.ru",
 })
 
 # 100.64.0.0/10 (CGNAT / Shared Address Space, RFC 6598) is NOT covered by
