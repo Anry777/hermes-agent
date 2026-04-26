@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig, _apply_env_overrides
@@ -40,10 +41,16 @@ class RecordingClient:
             return FakeResponse({"success": True})
         return FakeResponse({"message": {"id": f"msg-{len(self.posts)}"}})
 
-    async def get(self, url, *, params=None, headers=None):
-        self.gets.append({"url": url, "params": params or {}, "headers": headers or {}})
+    async def get(self, url, *, params=None, headers=None, timeout=None):
+        call = {"url": url, "params": params or {}, "headers": headers or {}}
+        if timeout is not None:
+            call["timeout"] = timeout
+        self.gets.append(call)
         if self._get_responses:
-            return self._get_responses.pop(0)
+            response = self._get_responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
         return FakeResponse({"marker": None, "updates": []})
 
     async def aclose(self):
@@ -217,13 +224,10 @@ class TestMaxAdapter:
 
         assert updates == [_message_update(update_id="poll-1")]
         assert adapter._poll_marker == 42
-        assert client.gets == [
-            {
-                "url": "https://platform-api.max.ru/updates",
-                "params": {"timeout": 1},
-                "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
-            }
-        ]
+        assert client.gets[0]["url"] == "https://platform-api.max.ru/updates"
+        assert client.gets[0]["params"] == {"timeout": 1}
+        assert client.gets[0]["headers"] == {"Authorization": "max-token", "Content-Type": "application/json"}
+        assert isinstance(client.gets[0]["timeout"], httpx.Timeout)
 
         await adapter._poll_once(timeout=1)
         assert client.gets[-1]["params"] == {"timeout": 1, "marker": 42}
@@ -258,13 +262,33 @@ class TestMaxAdapter:
         updates = await adapter._poll_once()
 
         assert updates == []
-        assert client.gets == [
-            {
-                "url": "https://platform-api.max.ru/updates",
-                "params": {"timeout": 7},
-                "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
-            }
-        ]
+        assert client.gets[0]["url"] == "https://platform-api.max.ru/updates"
+        assert client.gets[0]["params"] == {"timeout": 7}
+        assert client.gets[0]["headers"] == {"Authorization": "max-token", "Content-Type": "application/json"}
+        assert isinstance(client.gets[0]["timeout"], httpx.Timeout)
+
+    @pytest.mark.asyncio
+    async def test_poll_once_gives_http_read_timeout_headroom_over_long_poll_timeout(self):
+        adapter = _make_adapter(token="max-token", transport="polling", poll_timeout=20)
+        client = RecordingClient(get_responses=[FakeResponse({"marker": None, "updates": []})])
+        adapter._client = client
+
+        await adapter._poll_once()
+
+        request_timeout = client.gets[0]["timeout"]
+        assert isinstance(request_timeout, httpx.Timeout)
+        assert request_timeout.read > 20
+
+    @pytest.mark.asyncio
+    async def test_poll_once_treats_http_read_timeout_as_empty_poll_without_error_log(self, caplog):
+        adapter = _make_adapter(token="max-token", transport="polling", poll_timeout=20)
+        client = RecordingClient(get_responses=[httpx.ReadTimeout("long poll timed out")])
+        adapter._client = client
+
+        updates = await adapter._poll_once()
+
+        assert updates == []
+        assert "polling error" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_send_posts_text_to_chat_id_query_with_modern_body_fields(self):

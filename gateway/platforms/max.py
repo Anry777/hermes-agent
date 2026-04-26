@@ -282,11 +282,25 @@ class MaxAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {"timeout": poll_timeout}
         if self._poll_marker is not None:
             params["marker"] = self._poll_marker
-        response = await self._get_client().get(
-            f"{self.base_url}/updates",
-            params=params,
-            headers=self._headers(),
+        request_timeout = httpx.Timeout(
+            connect=10.0,
+            read=max(float(poll_timeout) + 10.0, 30.0),
+            write=30.0,
+            pool=30.0,
         )
+        try:
+            response = await self._get_client().get(
+                f"{self.base_url}/updates",
+                params=params,
+                headers=self._headers(),
+                timeout=request_timeout,
+            )
+        except httpx.ReadTimeout:
+            logger.debug(
+                "[MAX] polling read timeout after %ss; treating as an empty poll",
+                poll_timeout,
+            )
+            return []
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
