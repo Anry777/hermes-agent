@@ -49,6 +49,8 @@ DEFAULT_UPDATE_TYPES = ("message_created", "bot_started")
 DEFAULT_TRANSPORT = "webhook"
 TRANSPORT_WEBHOOK = "webhook"
 TRANSPORT_POLLING = "polling"
+DEFAULT_POLL_TIMEOUT = 30
+DEFAULT_POLL_IDLE_SLEEP = 1.0
 MAX_TEXT_LENGTH = 4000
 _SECRET_RE = re.compile(r"^[a-zA-Z0-9_-]{5,256}$")
 
@@ -96,6 +98,22 @@ def _split_csv(value: Any) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
+def _coerce_int(value: Any, default: int, *, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _coerce_float(value: Any, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
 class MaxAdapter(BasePlatformAdapter):
     """Webhook-first text-only adapter for MAX messenger bots."""
 
@@ -118,6 +136,14 @@ class MaxAdapter(BasePlatformAdapter):
         ).strip()
         self.webhook_secret = str(extra.get("webhook_secret") or os.getenv("MAX_WEBHOOK_SECRET") or "").strip()
         self.transport = _normalize_transport(extra.get("transport") or os.getenv("MAX_TRANSPORT") or DEFAULT_TRANSPORT)
+        self.poll_timeout = _coerce_int(
+            extra.get("poll_timeout") or os.getenv("MAX_POLL_TIMEOUT"),
+            DEFAULT_POLL_TIMEOUT,
+        )
+        self.poll_idle_sleep = _coerce_float(
+            extra.get("poll_idle_sleep") or os.getenv("MAX_POLL_IDLE_SLEEP"),
+            DEFAULT_POLL_IDLE_SLEEP,
+        )
         self.auto_subscribe = bool(
             extra.get("auto_subscribe")
             if "auto_subscribe" in extra
@@ -234,7 +260,7 @@ class MaxAdapter(BasePlatformAdapter):
         backoff = 1.0
         while self._running:
             try:
-                updates = await self._poll_once(timeout=30)
+                updates = await self._poll_once()
                 if updates is None:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 60.0)
@@ -242,6 +268,8 @@ class MaxAdapter(BasePlatformAdapter):
                 backoff = 1.0
                 for update in updates:
                     await self._handle_update(update)
+                if not updates and self.poll_idle_sleep > 0:
+                    await asyncio.sleep(self.poll_idle_sleep)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -249,8 +277,9 @@ class MaxAdapter(BasePlatformAdapter):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
-    async def _poll_once(self, *, timeout: int = 30) -> Optional[list[Dict[str, Any]]]:
-        params: Dict[str, Any] = {"timeout": timeout}
+    async def _poll_once(self, *, timeout: Optional[int] = None) -> Optional[list[Dict[str, Any]]]:
+        poll_timeout = self.poll_timeout if timeout is None else timeout
+        params: Dict[str, Any] = {"timeout": poll_timeout}
         if self._poll_marker is not None:
             params["marker"] = self._poll_marker
         response = await self._get_client().get(

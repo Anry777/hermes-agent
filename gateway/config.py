@@ -1315,6 +1315,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         max_webhook_port = os.getenv("MAX_WEBHOOK_PORT", "").strip()
         if max_webhook_port:
             extra["webhook_port"] = int(max_webhook_port)
+        max_poll_timeout = os.getenv("MAX_POLL_TIMEOUT", "").strip()
+        if max_poll_timeout:
+            extra["poll_timeout"] = int(max_poll_timeout)
+        max_poll_idle_sleep = os.getenv("MAX_POLL_IDLE_SLEEP", "").strip()
+        if max_poll_idle_sleep:
+            extra["poll_idle_sleep"] = float(max_poll_idle_sleep)
         max_auto_subscribe = os.getenv("MAX_AUTO_SUBSCRIBE", "").strip()
         if max_auto_subscribe:
             extra["auto_subscribe"] = max_auto_subscribe.lower() in ("true", "1", "yes", "on")

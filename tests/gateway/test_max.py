@@ -108,6 +108,8 @@ class TestMaxConfigLoading:
         monkeypatch.setenv("MAX_UPDATE_TYPES", "message_created,bot_started")
         monkeypatch.setenv("MAX_AUTO_SUBSCRIBE", "true")
         monkeypatch.setenv("MAX_TRANSPORT", "polling")
+        monkeypatch.setenv("MAX_POLL_TIMEOUT", "7")
+        monkeypatch.setenv("MAX_POLL_IDLE_SLEEP", "0.25")
 
         config = GatewayConfig()
         _apply_env_overrides(config)
@@ -125,6 +127,8 @@ class TestMaxConfigLoading:
         assert platform_config.extra["update_types"] == "message_created,bot_started"
         assert platform_config.extra["auto_subscribe"] is True
         assert platform_config.extra["transport"] == "polling"
+        assert platform_config.extra["poll_timeout"] == 7
+        assert platform_config.extra["poll_idle_sleep"] == 0.25
         assert platform_config.home_channel == HomeChannel(Platform.MAX, "777", "MAX Home")
         assert config.get_connected_platforms() == [Platform.MAX]
 
@@ -244,6 +248,23 @@ class TestMaxAdapter:
         await _drain_adapter_tasks(adapter)
 
         assert calls == [("from polling", "777", "123")]
+
+    @pytest.mark.asyncio
+    async def test_poll_once_uses_configured_default_timeout(self):
+        adapter = _make_adapter(token="max-token", transport="polling", poll_timeout=7)
+        client = RecordingClient(get_responses=[FakeResponse({"marker": None, "updates": []})])
+        adapter._client = client
+
+        updates = await adapter._poll_once()
+
+        assert updates == []
+        assert client.gets == [
+            {
+                "url": "https://platform-api.max.ru/updates",
+                "params": {"timeout": 7},
+                "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_send_posts_text_to_chat_id_query_with_modern_body_fields(self):
