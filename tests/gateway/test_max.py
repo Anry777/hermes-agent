@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig, _apply_env_overrides
-from gateway.platforms.base import MessageType
+from gateway.platforms.base import MessageType, SendResult
 from tools.send_message_tool import _parse_target_ref, _send_max, _send_to_platform
 
 
@@ -455,6 +455,62 @@ class TestMaxAdapter:
         assert client.posts == []
 
     @pytest.mark.asyncio
+    async def test_send_document_uploads_file_and_sends_file_attachment_with_caption(self, tmp_path):
+        doc_path = tmp_path / "report.xlsx"
+        doc_path.write_bytes(b"fake xlsx bytes")
+        upload_payload = {"token": "file-token", "filename": "report.xlsx"}
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient(post_responses=[
+            FakeResponse({"url": "https://upload.max.example/file-1"}),
+            FakeResponse(upload_payload),
+            FakeResponse({"message": {"mid": "msg-file"}}),
+        ])
+        adapter._client = client
+
+        result = await adapter.send_document(
+            "777",
+            str(doc_path),
+            caption="monthly report",
+            metadata={"target_type": "chat", "notify": False},
+        )
+
+        assert result.success is True
+        assert result.message_id == "msg-file"
+        assert client.posts[0] == {
+            "url": "https://platform-api.max.ru/uploads",
+            "params": {"type": "file"},
+            "json": {},
+            "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
+        }
+        assert client.posts[1]["url"] == "https://upload.max.example/file-1"
+        assert client.posts[1]["headers"] == {"Authorization": "max-token"}
+        assert "data" in client.posts[1]["files"]
+        assert client.posts[1]["files"]["data"][0] == "report.xlsx"
+        assert client.posts[1]["files"]["data"][2] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert client.posts[2] == {
+            "url": "https://platform-api.max.ru/messages",
+            "params": {"chat_id": "777"},
+            "json": {
+                "text": "monthly report",
+                "notify": False,
+                "attachments": [{"type": "file", "payload": upload_payload}],
+            },
+            "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_document_missing_local_file_fails_without_http_calls(self, tmp_path):
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient()
+        adapter._client = client
+
+        result = await adapter.send_document("777", str(tmp_path / "missing.txt"))
+
+        assert result.success is False
+        assert "does not exist" in result.error
+        assert client.posts == []
+
+    @pytest.mark.asyncio
     async def test_send_image_url_downloads_through_safe_cache_before_max_upload(self, tmp_path):
         image_path = tmp_path / "remote.png"
         image_path.write_bytes(b"fake remote png bytes")
@@ -543,6 +599,31 @@ class TestMaxAdapter:
         assert event.media_urls == ["https://cdn.example.com/large.webp"]
         assert event.media_types == ["image/webp"]
 
+    def test_message_created_update_converts_file_attachment_to_document_event(self):
+        adapter = _make_adapter(bot_user_id="999")
+        update = _message_update(
+            text="",
+            attachments=[
+                {
+                    "type": "file",
+                    "payload": {
+                        "url": "https://cdn.example.com/report.xlsx",
+                        "filename": "quarterly.xlsx",
+                        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    },
+                }
+            ],
+        )
+
+        event = adapter._update_to_event(update)
+
+        assert event is not None
+        assert event.text == ""
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == ["https://cdn.example.com/report.xlsx"]
+        assert event.media_types == ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+        assert event.raw_message["message"]["body"]["attachments"][0]["payload"]["filename"] == "quarterly.xlsx"
+
     @pytest.mark.asyncio
     async def test_handle_update_caches_image_attachment_before_dispatch(self):
         adapter = _make_adapter(bot_user_id="999")
@@ -598,6 +679,47 @@ class TestMaxAdapter:
         assert "Failed to cache MAX image attachment" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_handle_update_caches_file_attachment_before_dispatch(self):
+        adapter = _make_adapter(bot_user_id="999")
+        calls = []
+
+        async def handler(event):
+            calls.append(event)
+
+        adapter.set_message_handler(handler)
+        update = _message_update(
+            text="analyze",
+            attachments=[
+                {
+                    "type": "file",
+                    "payload": {
+                        "url": "https://cdn.example.com/report.md",
+                        "filename": "report.md",
+                        "mime_type": "text/markdown",
+                    },
+                }
+            ],
+        )
+
+        with patch(
+            "gateway.platforms.max.cache_document_from_url",
+            new_callable=AsyncMock,
+            return_value="/tmp/max_cached_report.md",
+        ) as cache:
+            await adapter._handle_update(update)
+            await _drain_adapter_tasks(adapter)
+
+        cache.assert_awaited_once_with(
+            "https://cdn.example.com/report.md",
+            filename="report.md",
+            mime_type="text/markdown",
+        )
+        assert len(calls) == 1
+        assert calls[0].message_type == MessageType.DOCUMENT
+        assert calls[0].media_urls == ["/tmp/max_cached_report.md"]
+        assert calls[0].media_types == ["text/markdown"]
+
+    @pytest.mark.asyncio
     async def test_webhook_requires_x_max_bot_api_secret_when_configured_and_acks_quickly(self):
         adapter = _make_adapter(webhook_secret="secret_123")
         calls = []
@@ -645,13 +767,14 @@ class TestMaxAdapter:
 
 
 class TestMaxPromptHints:
-    def test_max_platform_hint_advertises_native_image_media_delivery(self):
+    def test_max_platform_hint_advertises_native_file_media_delivery(self):
         from agent.prompt_builder import PLATFORM_HINTS
 
         hint = PLATFORM_HINTS["max"]
 
         assert "MEDIA:/absolute/path/to/file" in hint
         assert "Images" in hint
+        assert "downloadable MAX file attachments" in hint
         assert "native" in hint
         assert "SVG" in hint
 
@@ -738,3 +861,43 @@ class TestMaxSendMessageToolIntegration:
             "message_id": "img-1",
         }
         assert calls == [("777", str(image_path), "caption"), ("disconnect",)]
+
+    def test_send_max_native_document_media_uses_adapter_send_document(self, tmp_path):
+        doc_path = tmp_path / "report.md"
+        doc_path.write_text("# report\n", encoding="utf-8")
+        calls = []
+
+        class FakeMaxAdapter:
+            def __init__(self, pconfig):
+                self.pconfig = pconfig
+
+            async def send(self, chat_id, message):
+                raise AssertionError("text send should not be used for native document media")
+
+            async def send_image_file(self, chat_id, media_path, caption=None):
+                raise AssertionError("image sender should not be used for document media")
+
+            async def send_document(self, chat_id, media_path, caption=None):
+                calls.append((chat_id, media_path, caption))
+                return SendResult(success=True, message_id="doc-1")
+
+            async def disconnect(self):
+                calls.append(("disconnect",))
+
+        with patch("gateway.platforms.max.MaxAdapter", FakeMaxAdapter):
+            result = asyncio.run(
+                _send_max(
+                    SimpleNamespace(enabled=True, token="max-token", extra={}),
+                    "777",
+                    "caption",
+                    media_files=[(str(doc_path), False)],
+                )
+            )
+
+        assert result == {
+            "success": True,
+            "platform": "max",
+            "chat_id": "777",
+            "message_id": "doc-1",
+        }
+        assert calls == [("777", str(doc_path), "caption"), ("disconnect",)]

@@ -1487,7 +1487,7 @@ def _check_send_message():
 
 
 async def _send_max(pconfig, chat_id, message, media_files=None):
-    """Send via MAX Bot API directly, including native image MEDIA attachments."""
+    """Send via MAX Bot API directly, including native MEDIA attachments."""
     try:
         from gateway.platforms.max import MaxAdapter
     except ImportError as exc:
@@ -1518,16 +1518,15 @@ async def _send_max(pconfig, chat_id, message, media_files=None):
                 continue
 
             ext = os.path.splitext(media_path)[1].lower()
-            if ext not in _IMAGE_EXTS:
-                warning = f"MAX MEDIA file type not supported, skipping: {media_path}"
-                logger.warning(warning)
-                warnings.append(warning)
-                continue
-
-            last_result = await adapter.send_image_file(chat_id, media_path, caption=caption)
+            if ext in _IMAGE_EXTS:
+                last_result = await adapter.send_image_file(chat_id, media_path, caption=caption)
+                error_label = "image"
+            else:
+                last_result = await adapter.send_document(chat_id, media_path, caption=caption)
+                error_label = "document"
             caption = None
             if not last_result.success:
-                return _error(f"MAX image send failed: {last_result.error or 'unknown error'}")
+                return _error(f"MAX {error_label} send failed: {last_result.error or 'unknown error'}")
 
         if last_result is None:
             if message.strip():
@@ -1543,7 +1542,7 @@ async def _send_max(pconfig, chat_id, message, media_files=None):
                 if warnings:
                     payload["warnings"] = warnings
                 return payload
-            error = "No deliverable text or MAX image media remained after processing MEDIA tags"
+            error = "No deliverable text or MAX media remained after processing MEDIA tags"
             if warnings:
                 return {"error": error, "warnings": warnings}
             return {"error": error}

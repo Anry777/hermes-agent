@@ -9,13 +9,13 @@ Official MAX Bot API semantics used here:
 - MAX sends each webhook as an HTTPS POST containing an Update object;
 - webhook secrets are verified through X-Max-Bot-Api-Secret;
 - outbound text messages use POST /messages;
-- outbound image messages use POST /uploads?type=image, multipart upload field
-  data, then POST /messages with an image attachment;
+- outbound image/file messages use POST /uploads?type=image|file, multipart
+  upload field data, then POST /messages with the matching attachment;
 - explicit dev/test polling uses GET /updates;
 - bot token is sent in the Authorization header;
 - text payload uses NewMessageBody fields, with a 4000-character text limit;
-- inbound image attachments are mapped from MessageBody.attachments and cached
-  locally before dispatch so Hermes vision tools can read stable file paths.
+- inbound image/file attachments are mapped from MessageBody.attachments and cached
+  locally before dispatch so Hermes vision/document tools can read stable file paths.
 """
 
 from __future__ import annotations
@@ -45,7 +45,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _ssrf_redirect_guard,
+    cache_document_from_bytes,
     cache_image_from_url,
+    safe_url_for_log,
 )
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.session import SessionSource
@@ -123,6 +126,56 @@ def _coerce_float(value: Any, default: float, *, minimum: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return max(minimum, parsed)
+
+
+async def cache_document_from_url(
+    url: str,
+    *,
+    filename: str = "",
+    mime_type: str = "",
+    retries: int = 2,
+) -> str:
+    """Download a MAX document attachment safely and cache it locally."""
+    from tools.url_safety import is_safe_url
+
+    if not is_safe_url(url):
+        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+        "Accept": "*/*",
+    }
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        event_hooks={"response": [_ssrf_redirect_guard]},
+    ) as client:
+        for attempt in range(retries + 1):
+            try:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                resolved_name = _document_filename(filename, url, mime_type)
+                return cache_document_from_bytes(response.content, resolved_name)
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                    raise
+                if attempt < retries:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+
+
+def _document_filename(filename: str, url: str, mime_type: str = "") -> str:
+    candidate = os.path.basename(str(filename or "").replace("\x00", "").strip())
+    if not candidate:
+        candidate = os.path.basename(urlparse(url).path.rstrip("/"))
+    if not candidate:
+        candidate = "max_document"
+    if "." not in candidate:
+        guessed = mimetypes.guess_extension(mime_type or "")
+        if guessed:
+            candidate = f"{candidate}{guessed}"
+    return candidate
 
 
 class MaxAdapter(BasePlatformAdapter):
@@ -448,6 +501,30 @@ class MaxAdapter(BasePlatformAdapter):
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
 
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a local file to MAX and send it as a document attachment."""
+        metadata = metadata or {}
+        if not self.token:
+            return SendResult(success=False, error="MAX_BOT_TOKEN is not configured")
+        path = os.path.expanduser(str(file_path or ""))
+        if not path or not os.path.isfile(path):
+            return SendResult(success=False, error=f"MAX document file does not exist: {file_path}")
+        try:
+            upload_payload = await self._upload_media_file(path, upload_type="file")
+            body = self._message_body(text=caption or None, reply_to=reply_to, metadata=metadata)
+            body["attachments"] = [{"type": "file", "payload": upload_payload}]
+            return await self._post_message_body(chat_id, body, metadata, retry_attachment_not_ready=True)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
     async def _upload_media_file(self, file_path: str, *, upload_type: str) -> Dict[str, Any]:
         response = await self._get_client().post(
             f"{self.base_url}/uploads",
@@ -580,28 +657,48 @@ class MaxAdapter(BasePlatformAdapter):
         dedup_key = self._dedup_key(update, event)
         if self._dedup.is_duplicate(dedup_key):
             return
-        await self._cache_image_media(event)
+        await self._cache_attachment_media(event)
         await self.handle_message(event)
 
-    async def _cache_image_media(self, event: MessageEvent) -> None:
+    async def _cache_attachment_media(self, event: MessageEvent) -> None:
         if not event.media_urls:
             return
         cached_urls: list[str] = []
+        metadata_by_url = self._attachment_metadata_by_url(event.raw_message)
         for i, url in enumerate(event.media_urls):
             media_type = event.media_types[i] if i < len(event.media_types) else ""
-            if not (media_type.startswith("image/") or event.message_type == MessageType.PHOTO):
-                cached_urls.append(url)
+            if media_type.startswith("image/") or (not media_type and event.message_type == MessageType.PHOTO):
+                try:
+                    cached_urls.append(await cache_image_from_url(url, ext=self._image_ext(url, media_type)))
+                except Exception as exc:
+                    logger.warning(
+                        "[MAX] Failed to cache MAX image attachment %s: %s",
+                        safe_url_for_log(url),
+                        exc,
+                    )
+                    cached_urls.append(url)
                 continue
+            filename, explicit_mime = metadata_by_url.get(url, ("", ""))
             try:
-                cached_urls.append(await cache_image_from_url(url, ext=self._image_ext(url, media_type)))
+                cached_urls.append(
+                    await cache_document_from_url(
+                        url,
+                        filename=filename,
+                        mime_type=media_type or explicit_mime,
+                    )
+                )
             except Exception as exc:
                 logger.warning(
-                    "[MAX] Failed to cache MAX image attachment %s: %s",
-                    url,
+                    "[MAX] Failed to cache MAX file attachment %s: %s",
+                    safe_url_for_log(url),
                     exc,
                 )
                 cached_urls.append(url)
         event.media_urls = cached_urls
+
+    async def _cache_image_media(self, event: MessageEvent) -> None:
+        """Backward-compatible alias for older tests/extensions."""
+        await self._cache_attachment_media(event)
 
     def _update_to_event(self, update: Dict[str, Any]) -> Optional[MessageEvent]:
         if update.get("update_type") != "message_created":
@@ -615,7 +712,10 @@ class MaxAdapter(BasePlatformAdapter):
         body = message.get("body") if isinstance(message.get("body"), dict) else {}
         text = body.get("text")
         text = text if isinstance(text, str) else ""
-        media_urls, media_types = self._extract_image_media(body)
+        image_urls, image_types = self._extract_image_media(body)
+        file_urls, file_types = self._extract_file_media(body)
+        media_urls = image_urls + file_urls
+        media_types = image_types + file_types
         if not text.strip() and not media_urls:
             return None
         recipient = message.get("recipient") if isinstance(message.get("recipient"), dict) else {}
@@ -633,9 +733,14 @@ class MaxAdapter(BasePlatformAdapter):
         )
         message_id = self._extract_message_id(message)
         timestamp = self._timestamp(update, message)
+        message_type = MessageType.TEXT
+        if image_urls:
+            message_type = MessageType.PHOTO
+        elif file_urls:
+            message_type = MessageType.DOCUMENT
         return MessageEvent(
             text=text,
-            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+            message_type=message_type,
             source=source,
             raw_message=update,
             message_id=message_id,
@@ -677,6 +782,97 @@ class MaxAdapter(BasePlatformAdapter):
                 urls.append(url)
                 media_types.append(inferred_mime)
         return urls, media_types
+
+    @classmethod
+    def _extract_file_media(cls, body: Dict[str, Any]) -> tuple[list[str], list[str]]:
+        attachments = body.get("attachments")
+        if not isinstance(attachments, list):
+            return [], []
+        urls: list[str] = []
+        media_types: list[str] = []
+        seen: set[str] = set()
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            payload = attachment.get("payload") if isinstance(attachment.get("payload"), dict) else {}
+            att_type = _as_str(_first_present(attachment, "type", "attachment_type")).lower().strip()
+            mime = cls._file_mime(attachment, payload)
+            candidates = cls._file_url_candidates(attachment, payload)
+            if not candidates:
+                continue
+            if att_type in {"image", "photo"} or mime.startswith("image/"):
+                continue
+            for url in candidates:
+                if url in seen:
+                    continue
+                inferred_mime = mime or cls._mime_from_url_or_filename(url, cls._attachment_filename(attachment, payload))
+                if inferred_mime.startswith("image/"):
+                    continue
+                seen.add(url)
+                urls.append(url)
+                media_types.append(inferred_mime or "application/octet-stream")
+        return urls, media_types
+
+    @classmethod
+    def _attachment_metadata_by_url(cls, raw_message: Any) -> dict[str, tuple[str, str]]:
+        if not isinstance(raw_message, dict):
+            return {}
+        message = raw_message.get("message") if isinstance(raw_message.get("message"), dict) else {}
+        body = message.get("body") if isinstance(message.get("body"), dict) else {}
+        attachments = body.get("attachments")
+        if not isinstance(attachments, list):
+            return {}
+        metadata: dict[str, tuple[str, str]] = {}
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            payload = attachment.get("payload") if isinstance(attachment.get("payload"), dict) else {}
+            filename = cls._attachment_filename(attachment, payload)
+            mime = cls._file_mime(attachment, payload) or cls._image_mime(attachment, payload)
+            for url in cls._file_url_candidates(attachment, payload) + cls._image_url_candidates(attachment, payload):
+                metadata.setdefault(url, (filename, mime))
+        return metadata
+
+    @classmethod
+    def _file_url_candidates(cls, attachment: Dict[str, Any], payload: Dict[str, Any]) -> list[str]:
+        direct: list[str] = []
+        for container in (attachment, payload):
+            value = _first_present(
+                container,
+                "url",
+                "download_url",
+                "downloadUrl",
+                "file_url",
+                "fileUrl",
+                "href",
+            )
+            if isinstance(value, str) and value.strip():
+                direct.append(value.strip())
+            values = _first_present(container, "urls", "download_urls", "downloadUrls")
+            if isinstance(values, list):
+                direct.extend(str(item).strip() for item in values if str(item).strip())
+        return direct
+
+    @staticmethod
+    def _attachment_filename(attachment: Dict[str, Any], payload: Dict[str, Any]) -> str:
+        for container in (attachment, payload):
+            value = _first_present(container, "filename", "file_name", "fileName", "name", "title")
+            if isinstance(value, str) and value.strip():
+                return os.path.basename(value.replace("\x00", "").strip())
+        return ""
+
+    @staticmethod
+    def _file_mime(attachment: Dict[str, Any], payload: Dict[str, Any]) -> str:
+        for container in (attachment, payload):
+            value = _first_present(container, "mime_type", "mimeType", "content_type", "contentType")
+            if isinstance(value, str) and value.strip():
+                return value.lower().strip()
+        return ""
+
+    @staticmethod
+    def _mime_from_url_or_filename(url: str, filename: str = "") -> str:
+        guessed, _ = mimetypes.guess_type(filename or urlparse(url).path)
+        return guessed.lower() if guessed else ""
 
     @classmethod
     def _image_url_candidates(cls, attachment: Dict[str, Any], payload: Dict[str, Any]) -> list[str]:
