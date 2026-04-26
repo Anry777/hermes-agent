@@ -538,6 +538,22 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- MAX: native image attachment support through the gateway adapter ---
+    if platform == Platform.MAX and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_max(
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
@@ -1470,24 +1486,77 @@ def _check_send_message():
         return False
 
 
-async def _send_max(pconfig, chat_id, message):
-    """Send via MAX Bot API directly."""
+async def _send_max(pconfig, chat_id, message, media_files=None):
+    """Send via MAX Bot API directly, including native image MEDIA attachments."""
     try:
         from gateway.platforms.max import MaxAdapter
     except ImportError as exc:
         return _error(f"MAX direct send requires gateway.platforms.max: {exc}")
 
+    media_files = media_files or []
     adapter = MaxAdapter(pconfig)
+    warnings = []
     try:
-        result = await adapter.send(chat_id, message)
-        if result.success:
-            return {
-                "success": True,
-                "platform": "max",
-                "chat_id": chat_id,
-                "message_id": result.message_id,
-            }
-        return _error(f"MAX send failed: {result.error or 'unknown error'}")
+        if not media_files:
+            result = await adapter.send(chat_id, message)
+            if result.success:
+                return {
+                    "success": True,
+                    "platform": "max",
+                    "chat_id": chat_id,
+                    "message_id": result.message_id,
+                }
+            return _error(f"MAX send failed: {result.error or 'unknown error'}")
+
+        last_result = None
+        caption = message.strip() or None
+        for media_path, _is_voice in media_files:
+            if not os.path.exists(media_path):
+                warning = f"Media file not found, skipping: {media_path}"
+                logger.warning(warning)
+                warnings.append(warning)
+                continue
+
+            ext = os.path.splitext(media_path)[1].lower()
+            if ext not in _IMAGE_EXTS:
+                warning = f"MAX MEDIA file type not supported, skipping: {media_path}"
+                logger.warning(warning)
+                warnings.append(warning)
+                continue
+
+            last_result = await adapter.send_image_file(chat_id, media_path, caption=caption)
+            caption = None
+            if not last_result.success:
+                return _error(f"MAX image send failed: {last_result.error or 'unknown error'}")
+
+        if last_result is None:
+            if message.strip():
+                result = await adapter.send(chat_id, message)
+                if not result.success:
+                    return _error(f"MAX send failed: {result.error or 'unknown error'}")
+                payload = {
+                    "success": True,
+                    "platform": "max",
+                    "chat_id": chat_id,
+                    "message_id": result.message_id,
+                }
+                if warnings:
+                    payload["warnings"] = warnings
+                return payload
+            error = "No deliverable text or MAX image media remained after processing MEDIA tags"
+            if warnings:
+                return {"error": error, "warnings": warnings}
+            return {"error": error}
+
+        payload = {
+            "success": True,
+            "platform": "max",
+            "chat_id": chat_id,
+            "message_id": last_result.message_id,
+        }
+        if warnings:
+            payload["warnings"] = warnings
+        return payload
     except Exception as exc:
         return _error(f"MAX send failed: {exc}")
     finally:

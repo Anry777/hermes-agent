@@ -11,7 +11,7 @@ import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig, _apply_env_overrides
 from gateway.platforms.base import MessageType
-from tools.send_message_tool import _parse_target_ref, _send_to_platform
+from tools.send_message_tool import _parse_target_ref, _send_max, _send_to_platform
 
 
 class FakeResponse:
@@ -653,6 +653,7 @@ class TestMaxPromptHints:
         assert "MEDIA:/absolute/path/to/file" in hint
         assert "Images" in hint
         assert "native" in hint
+        assert "SVG" in hint
 
 
 class TestMaxSendMessageToolIntegration:
@@ -675,3 +676,65 @@ class TestMaxSendMessageToolIntegration:
         assert result["success"] is True
         assert send.await_count == 2
         assert all(len(call.args[2]) <= 4000 for call in send.await_args_list)
+
+    def test_send_to_platform_routes_max_media_to_native_sender(self, tmp_path):
+        image_path = tmp_path / "photo.png"
+        image_path.write_bytes(b"fake-png")
+        send = AsyncMock(return_value={"success": True, "platform": "max", "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_max", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.MAX,
+                    SimpleNamespace(enabled=True, token="max-token", extra={}),
+                    "777",
+                    "caption",
+                    media_files=[(str(image_path), False)],
+                )
+            )
+
+        assert result["success"] is True
+        assert "warnings" not in result
+        send.assert_awaited_once_with(
+            SimpleNamespace(enabled=True, token="max-token", extra={}),
+            "777",
+            "caption",
+            media_files=[(str(image_path), False)],
+        )
+
+    def test_send_max_native_image_media_uses_adapter_send_image_file(self, tmp_path):
+        image_path = tmp_path / "photo.png"
+        image_path.write_bytes(b"fake-png")
+        calls = []
+
+        class FakeMaxAdapter:
+            def __init__(self, pconfig):
+                self.pconfig = pconfig
+
+            async def send(self, chat_id, message):
+                raise AssertionError("text send should not be used for native image media")
+
+            async def send_image_file(self, chat_id, media_path, caption=None):
+                calls.append((chat_id, media_path, caption))
+                return SimpleNamespace(success=True, message_id="img-1", error=None)
+
+            async def disconnect(self):
+                calls.append(("disconnect",))
+
+        with patch("gateway.platforms.max.MaxAdapter", FakeMaxAdapter):
+            result = asyncio.run(
+                _send_max(
+                    SimpleNamespace(enabled=True, token="max-token", extra={}),
+                    "777",
+                    "caption",
+                    media_files=[(str(image_path), False)],
+                )
+            )
+
+        assert result == {
+            "success": True,
+            "platform": "max",
+            "chat_id": "777",
+            "message_id": "img-1",
+        }
+        assert calls == [("777", str(image_path), "caption"), ("disconnect",)]

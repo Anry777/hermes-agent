@@ -315,6 +315,7 @@ PLATFORM_HINTS = {
         "Keep responses chat-friendly and concise. You can send image files natively: "
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .jpeg, .gif, .webp) are uploaded and delivered as native photos. "
+        "Do not use SVG for MAX photo delivery; create or convert to a raster image first. "
         "You can also include image URLs in markdown format ![alt](url) and they will "
         "be downloaded safely, uploaded, and sent as native image attachments."
     ),
