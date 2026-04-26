@@ -215,6 +215,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "max": Platform.MAX,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -322,6 +323,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    if platform_name == "max":
+        stripped = target_ref.strip()
+        if stripped.startswith(("user:", "chat:")) and stripped.split(":", 1)[1].strip():
+            return stripped, None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -444,6 +449,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
+    try:
+        from gateway.platforms.max import MaxAdapter
+        _MAX_LENGTHS[Platform.MAX] = MaxAdapter.MAX_MESSAGE_LENGTH
+    except ImportError:
+        _MAX_LENGTHS[Platform.MAX] = 4000
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
@@ -571,6 +581,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.MAX:
+            result = await _send_max(pconfig, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1456,6 +1468,33 @@ def _check_send_message():
         return is_gateway_running()
     except Exception:
         return False
+
+
+async def _send_max(pconfig, chat_id, message):
+    """Send via MAX Bot API directly."""
+    try:
+        from gateway.platforms.max import MaxAdapter
+    except ImportError as exc:
+        return _error(f"MAX direct send requires gateway.platforms.max: {exc}")
+
+    adapter = MaxAdapter(pconfig)
+    try:
+        result = await adapter.send(chat_id, message)
+        if result.success:
+            return {
+                "success": True,
+                "platform": "max",
+                "chat_id": chat_id,
+                "message_id": result.message_id,
+            }
+        return _error(f"MAX send failed: {result.error or 'unknown error'}")
+    except Exception as exc:
+        return _error(f"MAX send failed: {exc}")
+    finally:
+        try:
+            await adapter.disconnect()
+        except Exception:
+            pass
 
 
 async def _send_qqbot(pconfig, chat_id, message):

@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    MAX = "max"
 
 
 @dataclass
@@ -313,6 +314,9 @@ class GatewayConfig:
                 connected.append(platform)
             # QQBot uses extra dict for app credentials
             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
+                connected.append(platform)
+            # MAX uses a Bot API token in the Authorization header
+            elif platform == Platform.MAX and config.token:
                 connected.append(platform)
             # DingTalk uses client_id/client_secret from config.extra or env vars
             elif platform == Platform.DINGTALK and (
@@ -811,6 +815,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.MAX: "MAX_BOT_TOKEN",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -1274,6 +1279,53 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.QQBOT,
                 chat_id=qq_home,
                 name=os.getenv("QQBOT_HOME_CHANNEL_NAME") or os.getenv(qq_home_name_env, "Home"),
+            )
+
+    # MAX messenger Bot API
+    max_token = os.getenv("MAX_BOT_TOKEN", "").strip()
+    if max_token:
+        if Platform.MAX not in config.platforms:
+            config.platforms[Platform.MAX] = PlatformConfig()
+        config.platforms[Platform.MAX].enabled = True
+        config.platforms[Platform.MAX].token = max_token
+        extra = config.platforms[Platform.MAX].extra
+        max_allowed_users = os.getenv("MAX_ALLOWED_USERS", "").strip()
+        if max_allowed_users:
+            extra["allow_from"] = max_allowed_users
+        max_group_allowed = os.getenv("MAX_GROUP_ALLOWED_USERS", "").strip()
+        if max_group_allowed:
+            extra["group_allow_from"] = max_group_allowed
+        max_allow_all = os.getenv("MAX_ALLOW_ALL_USERS", "").strip()
+        if max_allow_all:
+            extra["allow_all_users"] = max_allow_all.lower() in ("true", "1", "yes", "on")
+        max_base_url = os.getenv("MAX_BASE_URL", "").strip()
+        if max_base_url:
+            extra["base_url"] = max_base_url.rstrip("/")
+        for env_name, extra_key in (
+            ("MAX_WEBHOOK_HOST", "webhook_host"),
+            ("MAX_WEBHOOK_PATH", "webhook_path"),
+            ("MAX_WEBHOOK_PUBLIC_URL", "webhook_public_url"),
+            ("MAX_WEBHOOK_SECRET", "webhook_secret"),
+            ("MAX_UPDATE_TYPES", "update_types"),
+        ):
+            value = os.getenv(env_name, "").strip()
+            if value:
+                extra[extra_key] = value
+        max_webhook_port = os.getenv("MAX_WEBHOOK_PORT", "").strip()
+        if max_webhook_port:
+            extra["webhook_port"] = int(max_webhook_port)
+        max_auto_subscribe = os.getenv("MAX_AUTO_SUBSCRIBE", "").strip()
+        if max_auto_subscribe:
+            extra["auto_subscribe"] = max_auto_subscribe.lower() in ("true", "1", "yes", "on")
+        max_bot_user_id = os.getenv("MAX_BOT_USER_ID", "").strip()
+        if max_bot_user_id:
+            extra["bot_user_id"] = max_bot_user_id
+        max_home = os.getenv("MAX_HOME_CHANNEL", "").strip()
+        if max_home:
+            config.platforms[Platform.MAX].home_channel = HomeChannel(
+                platform=Platform.MAX,
+                chat_id=max_home,
+                name=os.getenv("MAX_HOME_CHANNEL_NAME", "Home"),
             )
 
     # Session settings

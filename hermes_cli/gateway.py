@@ -2724,6 +2724,32 @@ _PLATFORMS = [
              "help": "OpenID to deliver cron results and notifications to."},
         ],
     },
+    {
+        "key": "max",
+        "label": "MAX",
+        "emoji": "💬",
+        "token_var": "MAX_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Create a MAX bot and copy its Bot API token from the MAX developer console",
+            "2. Add the bot to a chat/channel when you want group or channel updates",
+            "3. For group/channel delivery, make the bot an admin as required by MAX",
+            "4. Configure an HTTPS webhook endpoint on port 443; MAX recommends Webhook for production",
+            "5. Hermes can auto-create POST /subscriptions when MAX_WEBHOOK_PUBLIC_URL is set",
+        ],
+        "vars": [
+            {"name": "MAX_BOT_TOKEN", "prompt": "MAX Bot API token", "password": True,
+             "help": "Sent as the raw Authorization header to https://platform-api.max.ru."},
+            {"name": "MAX_WEBHOOK_PUBLIC_URL", "prompt": "Public HTTPS webhook URL (no explicit port, or empty to register manually)", "password": False,
+             "help": "MAX delivers production events to HTTPS port 443, e.g. https://bot.example.com/max-webhook."},
+            {"name": "MAX_WEBHOOK_SECRET", "prompt": "Webhook secret for X-Max-Bot-Api-Secret", "password": True,
+             "help": "Recommended by MAX. Use 5-256 chars: A-Z, a-z, 0-9, underscore, hyphen."},
+            {"name": "MAX_ALLOWED_USERS", "prompt": "Allowed MAX user IDs (comma-separated, leave empty for pairing/open policy)", "password": False,
+             "is_allowlist": True,
+             "help": "Optional — restrict DM access to specific MAX user IDs."},
+            {"name": "MAX_HOME_CHANNEL", "prompt": "Home target for cron/notifications (chat:<id> or user:<id>, or empty)", "password": False,
+             "help": "Use chat:<id> for chats/channels or user:<id> for direct user delivery."},
+        ],
+    },
 ]
 
 

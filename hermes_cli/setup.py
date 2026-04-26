@@ -2286,6 +2286,7 @@ def setup_gateway(config: dict):
         or get_env_value("WEIXIN_ACCOUNT_ID")
         or get_env_value("BLUEBUBBLES_SERVER_URL")
         or get_env_value("QQ_APP_ID")
+        or get_env_value("MAX_BOT_TOKEN")
         or get_env_value("WEBHOOK_ENABLED")
     )
     if any_messaging:
@@ -2311,6 +2312,8 @@ def setup_gateway(config: dict):
             get_env_value("QQBOT_HOME_CHANNEL") or get_env_value("QQ_HOME_CHANNEL")
         ):
             missing_home.append("QQBot")
+        if get_env_value("MAX_BOT_TOKEN") and not get_env_value("MAX_HOME_CHANNEL"):
+            missing_home.append("MAX")
 
         if missing_home:
             print()
