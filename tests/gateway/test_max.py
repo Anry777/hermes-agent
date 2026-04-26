@@ -772,7 +772,11 @@ class TestMaxPromptHints:
 
         hint = PLATFORM_HINTS["max"]
 
-        assert "MEDIA:/absolute/path/to/file" in hint
+        assert "MEDIA:<real local file path>" in hint
+        assert "plain line" in hint
+        assert "backticks" in hint
+        assert "code block" in hint
+        assert "/absolute/path" not in hint
         assert "Images" in hint
         assert "downloadable MAX file attachments" in hint
         assert "native" in hint

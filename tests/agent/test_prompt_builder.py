@@ -807,6 +807,15 @@ class TestPromptBuilderConstants:
         # check that this test is calibrated correctly).
         assert "include MEDIA:" in PLATFORM_HINTS["telegram"]
 
+    def test_max_hint_uses_plain_media_directive_without_placeholder_paths(self):
+        hint = PLATFORM_HINTS["max"]
+
+        assert "MEDIA:" in hint
+        assert "plain line" in hint.lower()
+        assert "backticks" in hint.lower()
+        assert "code block" in hint.lower()
+        assert "/absolute/path" not in hint
+
     def test_platform_hints_mattermost(self):
         hint = PLATFORM_HINTS["mattermost"]
         assert "Mattermost" in hint

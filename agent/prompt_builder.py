@@ -313,7 +313,8 @@ PLATFORM_HINTS = {
     "max": (
         "You are on MAX messenger communicating with your user. "
         "Keep responses chat-friendly and concise. You can send files natively: "
-        "include MEDIA:/absolute/path/to/file in your response. Images "
+        "write MEDIA:<real local file path> on its own plain line in the response, "
+        "without backticks and without wrapping it in a markdown code block. Images "
         "(.png, .jpg, .jpeg, .gif, .webp) are uploaded and delivered as native photos; "
         "other local files (.pdf, .txt, .md, .csv, .docx, .xlsx, etc.) are sent as "
         "downloadable MAX file attachments. Do not use SVG for MAX photo delivery; "

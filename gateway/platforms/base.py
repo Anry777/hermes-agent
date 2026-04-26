@@ -1457,17 +1457,43 @@ class BasePlatformAdapter(ABC):
         media_pattern = re.compile(
             r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
+
+        protected_spans: list[tuple[int, int]] = []
+        for protected in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            protected_spans.append((protected.start(), protected.end()))
+        for protected in re.finditer(r'`[^`\n]+`', content):
+            protected_spans.append((protected.start(), protected.end()))
+
+        def _in_protected_span(pos: int) -> bool:
+            return any(start <= pos < end for start, end in protected_spans)
+
+        def _is_documentation_placeholder(path: str) -> bool:
+            normalized = path.strip()
+            return normalized == "/path" or normalized.startswith("/absolute/path/")
+
+        remove_spans: list[tuple[int, int]] = []
         for match in media_pattern.finditer(content):
+            if _in_protected_span(match.start()):
+                continue
             path = match.group("path").strip()
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-            if path:
+            if path and not _is_documentation_placeholder(path):
                 media.append((os.path.expanduser(path), has_voice_tag))
+                remove_spans.append((match.start(), match.end()))
 
-        # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
-        if media:
-            cleaned = media_pattern.sub('', cleaned)
+        # Remove only accepted MEDIA tags from content. Documentation examples
+        # such as `MEDIA:/absolute/path/to/file.pdf` must stay visible and must
+        # not trigger noisy attachment-send attempts.
+        if remove_spans:
+            parts: list[str] = []
+            last = 0
+            for start, end in remove_spans:
+                parts.append(content[last:start])
+                last = end
+            parts.append(content[last:])
+            cleaned = ''.join(parts).replace("[[audio_as_voice]]", "")
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned

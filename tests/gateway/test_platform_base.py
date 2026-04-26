@@ -321,6 +321,30 @@ class TestExtractMedia:
         assert "Here" in cleaned
         assert "After" in cleaned
 
+    def test_media_tag_inside_fenced_code_block_is_documentation_not_attachment(self):
+        content = "Example:\n```text\nMEDIA:/absolute/path/to/file.pdf\n```"
+
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == []
+        assert cleaned == content
+
+    def test_media_tag_inside_inline_code_is_documentation_not_attachment(self):
+        content = "Use `MEDIA:/absolute/path/to/file.pdf` as a plain response directive."
+
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == []
+        assert cleaned == content
+
+    def test_media_tag_ignores_documentation_placeholder_paths(self):
+        content = "Examples:\nMEDIA:/absolute/path/to/image.jpg\nMEDIA:/path"
+
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == []
+        assert cleaned == content
+
 
 # ---------------------------------------------------------------------------
 # truncate_message
