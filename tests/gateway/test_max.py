@@ -144,6 +144,7 @@ class TestMaxConfigLoading:
         monkeypatch.setenv("MAX_TRANSPORT", "polling")
         monkeypatch.setenv("MAX_POLL_TIMEOUT", "7")
         monkeypatch.setenv("MAX_POLL_IDLE_SLEEP", "0.25")
+        monkeypatch.setenv("MAX_TEXT_FORMAT", "html")
 
         config = GatewayConfig()
         _apply_env_overrides(config)
@@ -163,6 +164,7 @@ class TestMaxConfigLoading:
         assert platform_config.extra["transport"] == "polling"
         assert platform_config.extra["poll_timeout"] == 7
         assert platform_config.extra["poll_idle_sleep"] == 0.25
+        assert platform_config.extra["text_format"] == "html"
         assert platform_config.home_channel == HomeChannel(Platform.MAX, "777", "MAX Home")
         assert config.get_connected_platforms() == [Platform.MAX]
 
@@ -337,6 +339,39 @@ class TestMaxAdapter:
         ]
 
     @pytest.mark.asyncio
+    async def test_send_defaults_to_markdown_format_for_plain_gateway_replies(self):
+        adapter = _make_adapter(token="max-token")
+        client = RecordingClient()
+        adapter._client = client
+
+        result = await adapter.send("777", "**hello**", metadata={"target_type": "chat"})
+
+        assert result.success is True
+        assert client.posts[0]["json"] == {"text": "**hello**", "format": "markdown"}
+
+    @pytest.mark.asyncio
+    async def test_send_uses_configured_text_format_and_metadata_override(self):
+        adapter = _make_adapter(token="max-token", text_format="html")
+        client = RecordingClient()
+        adapter._client = client
+
+        await adapter.send("777", "<b>hello</b>", metadata={"target_type": "chat"})
+        await adapter.send("777", "**hello**", metadata={"target_type": "chat", "format": "markdown"})
+
+        assert client.posts[0]["json"] == {"text": "<b>hello</b>", "format": "html"}
+        assert client.posts[1]["json"] == {"text": "**hello**", "format": "markdown"}
+
+    @pytest.mark.asyncio
+    async def test_send_omits_invalid_or_disabled_text_format(self):
+        adapter = _make_adapter(token="max-token", text_format="plain")
+        client = RecordingClient()
+        adapter._client = client
+
+        await adapter.send("777", "hello", metadata={"target_type": "chat"})
+
+        assert client.posts[0]["json"] == {"text": "hello"}
+
+    @pytest.mark.asyncio
     async def test_send_can_target_user_id_explicitly(self):
         adapter = _make_adapter(token="max-token")
         client = RecordingClient()
@@ -396,6 +431,7 @@ class TestMaxAdapter:
             "json": {
                 "text": "cat caption",
                 "notify": False,
+                "format": "markdown",
                 "attachments": [{"type": "image", "payload": upload_payload}],
             },
             "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
@@ -493,6 +529,7 @@ class TestMaxAdapter:
             "json": {
                 "text": "monthly report",
                 "notify": False,
+                "format": "markdown",
                 "attachments": [{"type": "file", "payload": upload_payload}],
             },
             "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
@@ -534,6 +571,7 @@ class TestMaxAdapter:
         cache.assert_awaited_once_with("https://cdn.example.com/remote.png")
         assert client.posts[2]["json"] == {
             "text": "remote",
+            "format": "markdown",
             "attachments": [{"type": "image", "payload": upload_payload}],
         }
 

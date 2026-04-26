@@ -811,6 +811,10 @@ class TestPromptBuilderConstants:
         hint = PLATFORM_HINTS["max"]
 
         assert "MEDIA:" in hint
+        assert "Markdown" in hint
+        assert "**bold**" in hint
+        assert "`inline code`" in hint
+        assert "links" in hint.lower()
         assert "plain line" in hint.lower()
         assert "backticks" in hint.lower()
         assert "code block" in hint.lower()

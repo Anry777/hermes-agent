@@ -312,9 +312,12 @@ PLATFORM_HINTS = {
     ),
     "max": (
         "You are on MAX messenger communicating with your user. "
-        "Keep responses chat-friendly and concise. You can send files natively: "
-        "write MEDIA:<real local file path> on its own plain line in the response, "
-        "without backticks and without wrapping it in a markdown code block. Images "
+        "Keep responses chat-friendly and concise. MAX renders outgoing text as Markdown: "
+        "use **bold**, *italic*, ++underline++, ~~strikethrough~~, `inline code`, "
+        "and [links](https://example.com) when they make the answer easier to scan. "
+        "Avoid oversized tables and fenced code blocks unless the user explicitly needs code. "
+        "You can send files natively: write MEDIA:<real local file path> on its own plain line "
+        "in the response, without backticks and without wrapping it in a markdown code block. Images "
         "(.png, .jpg, .jpeg, .gif, .webp) are uploaded and delivered as native photos; "
         "other local files (.pdf, .txt, .md, .csv, .docx, .xlsx, etc.) are sent as "
         "downloadable MAX file attachments. Do not use SVG for MAX photo delivery; "

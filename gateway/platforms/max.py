@@ -65,6 +65,8 @@ TRANSPORT_WEBHOOK = "webhook"
 TRANSPORT_POLLING = "polling"
 DEFAULT_POLL_TIMEOUT = 30
 DEFAULT_POLL_IDLE_SLEEP = 1.0
+DEFAULT_TEXT_FORMAT = "markdown"
+SUPPORTED_TEXT_FORMATS = {"markdown", "html"}
 MAX_TEXT_LENGTH = 4000
 _SECRET_RE = re.compile(r"^[a-zA-Z0-9_-]{5,256}$")
 
@@ -74,6 +76,14 @@ def _normalize_transport(value: Any) -> str:
     if raw in {"polling", "long_polling", "longpolling"}:
         return TRANSPORT_POLLING
     return TRANSPORT_WEBHOOK
+
+
+def _normalize_text_format(value: Any) -> str:
+    """Normalize MAX text format to official Bot API values or disabled."""
+    raw = str(value or "").strip().lower()
+    if raw in SUPPORTED_TEXT_FORMATS:
+        return raw
+    return ""
 
 
 def check_max_requirements() -> bool:
@@ -200,6 +210,8 @@ class MaxAdapter(BasePlatformAdapter):
         ).strip()
         self.webhook_secret = str(extra.get("webhook_secret") or os.getenv("MAX_WEBHOOK_SECRET") or "").strip()
         self.transport = _normalize_transport(extra.get("transport") or os.getenv("MAX_TRANSPORT") or DEFAULT_TRANSPORT)
+        text_format = extra.get("text_format") if "text_format" in extra else os.getenv("MAX_TEXT_FORMAT", DEFAULT_TEXT_FORMAT)
+        self.text_format = _normalize_text_format(text_format)
         self.poll_timeout = _coerce_int(
             extra.get("poll_timeout") or os.getenv("MAX_POLL_TIMEOUT"),
             DEFAULT_POLL_TIMEOUT,
@@ -574,9 +586,15 @@ class MaxAdapter(BasePlatformAdapter):
             body["link"] = {"type": "reply", "mid": reply_to}
         if "notify" in metadata:
             body["notify"] = bool(metadata["notify"])
-        if metadata.get("format"):
-            body["format"] = metadata["format"]
+        text_format = self._resolve_text_format(metadata)
+        if text and text_format:
+            body["format"] = text_format
         return body
+
+    def _resolve_text_format(self, metadata: Dict[str, Any]) -> str:
+        if "format" in metadata:
+            return _normalize_text_format(metadata.get("format"))
+        return self.text_format
 
     async def _post_message_body(
         self,
