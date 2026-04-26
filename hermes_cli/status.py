@@ -346,6 +346,18 @@ def show_status(args):
             status += f" (home: {home_channel})"
         
         print(f"  {name:<12}  {check_mark(has_token)} {status}")
+
+    try:
+        from hermes_cli.gateway import _max_operator_diagnostic_lines
+
+        max_lines = _max_operator_diagnostic_lines()
+        if max_lines:
+            print()
+            print(color("◆ MAX Gateway", Colors.CYAN, Colors.BOLD))
+            for line in max_lines:
+                print(f"  {line}")
+    except Exception:
+        pass
     
     # =========================================================================
     # Gateway Status

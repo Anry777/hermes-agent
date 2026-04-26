@@ -6,6 +6,60 @@ from unittest.mock import patch, call
 import hermes_cli.gateway as gateway
 
 
+class TestMaxGatewayOperatorUx:
+    def test_platform_status_guides_webhook_config_without_public_url(self, monkeypatch):
+        monkeypatch.setenv("MAX_BOT_TOKEN", "max-token")
+        monkeypatch.delenv("MAX_TRANSPORT", raising=False)
+        monkeypatch.delenv("MAX_WEBHOOK_PUBLIC_URL", raising=False)
+
+        platform = next(p for p in gateway._PLATFORMS if p["key"] == "max")
+
+        assert gateway._platform_status(platform) == "configured, webhook needs public URL or polling"
+
+    def test_platform_status_summarizes_polling_cadence(self, monkeypatch):
+        monkeypatch.setenv("MAX_BOT_TOKEN", "max-token")
+        monkeypatch.setenv("MAX_TRANSPORT", "polling")
+        monkeypatch.setenv("MAX_POLL_TIMEOUT", "7")
+        monkeypatch.setenv("MAX_POLL_IDLE_SLEEP", "0.25")
+
+        platform = next(p for p in gateway._PLATFORMS if p["key"] == "max")
+
+        assert gateway._platform_status(platform) == "configured, polling dev/test (timeout 7s, idle 0.25s)"
+
+    def test_max_operator_diagnostics_for_polling_mode(self, monkeypatch):
+        monkeypatch.setenv("MAX_BOT_TOKEN", "max-token")
+        monkeypatch.setenv("MAX_TRANSPORT", "polling")
+        monkeypatch.setenv("MAX_POLL_TIMEOUT", "7")
+        monkeypatch.setenv("MAX_POLL_IDLE_SLEEP", "0.25")
+        monkeypatch.setenv("MAX_HOME_CHANNEL", "chat:777")
+
+        lines = gateway._max_operator_diagnostic_lines()
+
+        assert lines == [
+            "MAX transport: polling (local development/testing)",
+            "Inbound: GET /updates; no public HTTPS webhook URL is required",
+            "Polling cadence: timeout 7s, idle sleep 0.25s",
+            "Home target: chat:777",
+            "Next: start with `hermes gateway run` after the MAX bot is approved",
+        ]
+
+    def test_max_operator_diagnostics_for_webhook_missing_url(self, monkeypatch):
+        monkeypatch.setenv("MAX_BOT_TOKEN", "max-token")
+        monkeypatch.delenv("MAX_TRANSPORT", raising=False)
+        monkeypatch.delenv("MAX_WEBHOOK_PUBLIC_URL", raising=False)
+        monkeypatch.delenv("MAX_WEBHOOK_SECRET", raising=False)
+
+        lines = gateway._max_operator_diagnostic_lines()
+
+        assert lines == [
+            "MAX transport: webhook (production default)",
+            "Missing MAX_WEBHOOK_PUBLIC_URL for production webhooks",
+            "For local testing without a public URL, set MAX_TRANSPORT=polling",
+            "Webhook secret: not set (recommended for X-Max-Bot-Api-Secret)",
+            "Next: complete MAX bot approval, then run `hermes gateway setup` or set env vars",
+        ]
+
+
 class TestSystemdLingerStatus:
     def test_reports_enabled(self, monkeypatch):
         monkeypatch.setattr(gateway, "is_linux", lambda: True)

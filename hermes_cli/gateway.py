@@ -2756,6 +2756,64 @@ _PLATFORMS = [
 ]
 
 
+def _max_env(name: str) -> str:
+    return (get_env_value(name) or "").strip()
+
+
+def _max_transport() -> str:
+    transport = _max_env("MAX_TRANSPORT").lower() or "webhook"
+    return transport if transport in {"webhook", "polling"} else "webhook"
+
+
+def _max_poll_timeout() -> str:
+    return _max_env("MAX_POLL_TIMEOUT") or "30"
+
+
+def _max_poll_idle_sleep() -> str:
+    return _max_env("MAX_POLL_IDLE_SLEEP") or "1.0"
+
+
+def _max_operator_diagnostic_lines() -> list[str]:
+    """Return MAX setup/status hints that do not require a live bot token probe."""
+    token = _max_env("MAX_BOT_TOKEN")
+    if not token:
+        return []
+
+    transport = _max_transport()
+    home = _max_env("MAX_HOME_CHANNEL")
+    lines: list[str] = []
+
+    if transport == "polling":
+        lines.extend([
+            "MAX transport: polling (local development/testing)",
+            "Inbound: GET /updates; no public HTTPS webhook URL is required",
+            f"Polling cadence: timeout {_max_poll_timeout()}s, idle sleep {_max_poll_idle_sleep()}s",
+        ])
+    else:
+        webhook_url = _max_env("MAX_WEBHOOK_PUBLIC_URL")
+        webhook_secret = _max_env("MAX_WEBHOOK_SECRET")
+        auto_subscribe = _max_env("MAX_AUTO_SUBSCRIBE").lower() in {"1", "true", "yes", "on"}
+        lines.append("MAX transport: webhook (production default)")
+        if webhook_url:
+            lines.append(f"Webhook URL: {webhook_url}")
+            lines.append(f"Auto-subscribe: {'enabled' if auto_subscribe else 'disabled'}")
+        else:
+            lines.extend([
+                "Missing MAX_WEBHOOK_PUBLIC_URL for production webhooks",
+                "For local testing without a public URL, set MAX_TRANSPORT=polling",
+            ])
+        if not webhook_secret:
+            lines.append("Webhook secret: not set (recommended for X-Max-Bot-Api-Secret)")
+
+    if home:
+        lines.append(f"Home target: {home}")
+    if transport == "polling":
+        lines.append("Next: start with `hermes gateway run` after the MAX bot is approved")
+    else:
+        lines.append("Next: complete MAX bot approval, then run `hermes gateway setup` or set env vars")
+    return lines
+
+
 def _platform_status(platform: dict) -> str:
     """Return a plain-text status string for a platform.
 
@@ -2804,6 +2862,14 @@ def _platform_status(platform: dict) -> str:
         if val or token:
             return "partially configured"
         return "not configured"
+    if platform.get("key") == "max":
+        if not val:
+            return "not configured"
+        if _max_transport() == "polling":
+            return f"configured, polling dev/test (timeout {_max_poll_timeout()}s, idle {_max_poll_idle_sleep()}s)"
+        if not _max_env("MAX_WEBHOOK_PUBLIC_URL"):
+            return "configured, webhook needs public URL or polling"
+        return "configured, webhook"
     if val:
         return "configured"
     return "not configured"
