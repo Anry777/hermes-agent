@@ -1,12 +1,15 @@
 """MAX messenger platform adapter.
 
 Webhook-first, text-only MAX Bot API integration for Hermes gateway.
+An explicit MAX_TRANSPORT=polling mode is available for local development/testing
+without a public HTTPS URL; webhook remains the production default.
 
 Official MAX Bot API semantics used here:
 - production inbound delivery is Webhook via POST /subscriptions;
 - MAX sends each webhook as an HTTPS POST containing an Update object;
 - webhook secrets are verified through X-Max-Bot-Api-Secret;
 - outbound text messages use POST /messages;
+- explicit dev/test polling uses GET /updates;
 - bot token is sent in the Authorization header;
 - text payload uses NewMessageBody fields, with a 4000-character text limit.
 """
@@ -43,13 +46,27 @@ DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 DEFAULT_WEBHOOK_PORT = 8647
 DEFAULT_WEBHOOK_PATH = "/max-webhook"
 DEFAULT_UPDATE_TYPES = ("message_created", "bot_started")
+DEFAULT_TRANSPORT = "webhook"
+TRANSPORT_WEBHOOK = "webhook"
+TRANSPORT_POLLING = "polling"
 MAX_TEXT_LENGTH = 4000
 _SECRET_RE = re.compile(r"^[a-zA-Z0-9_-]{5,256}$")
 
 
+def _normalize_transport(value: Any) -> str:
+    raw = str(value or DEFAULT_TRANSPORT).strip().lower().replace("-", "_")
+    if raw in {"polling", "long_polling", "longpolling"}:
+        return TRANSPORT_POLLING
+    return TRANSPORT_WEBHOOK
+
+
 def check_max_requirements() -> bool:
     """Return True when MAX is configured enough to start."""
-    return bool(os.getenv("MAX_BOT_TOKEN", "").strip()) and AIOHTTP_AVAILABLE
+    if not os.getenv("MAX_BOT_TOKEN", "").strip():
+        return False
+    if _normalize_transport(os.getenv("MAX_TRANSPORT")) == TRANSPORT_POLLING:
+        return True
+    return AIOHTTP_AVAILABLE
 
 
 def _as_str(value: Any) -> str:
@@ -100,6 +117,7 @@ class MaxAdapter(BasePlatformAdapter):
             extra.get("webhook_public_url") or os.getenv("MAX_WEBHOOK_PUBLIC_URL") or ""
         ).strip()
         self.webhook_secret = str(extra.get("webhook_secret") or os.getenv("MAX_WEBHOOK_SECRET") or "").strip()
+        self.transport = _normalize_transport(extra.get("transport") or os.getenv("MAX_TRANSPORT") or DEFAULT_TRANSPORT)
         self.auto_subscribe = bool(
             extra.get("auto_subscribe")
             if "auto_subscribe" in extra
@@ -108,6 +126,8 @@ class MaxAdapter(BasePlatformAdapter):
         self.update_types = _split_csv(extra.get("update_types") or os.getenv("MAX_UPDATE_TYPES")) or list(DEFAULT_UPDATE_TYPES)
         self._client: Optional[httpx.AsyncClient] = None
         self._runner = None
+        self._polling_task: Optional[asyncio.Task] = None
+        self._poll_marker: Any = extra.get("polling_marker")
         self._dedup = MessageDeduplicator(max_size=5000, ttl_seconds=600)
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -127,10 +147,12 @@ class MaxAdapter(BasePlatformAdapter):
         return self._client
 
     async def connect(self) -> bool:
-        """Start the local webhook receiver and optionally subscribe it in MAX."""
+        """Start the configured MAX inbound transport."""
         if not self.token:
             logger.error("[MAX] MAX_BOT_TOKEN is not configured")
             return False
+        if self.transport == TRANSPORT_POLLING:
+            return await self._connect_polling()
         if not AIOHTTP_AVAILABLE:
             logger.error("[MAX] aiohttp is required for webhook delivery")
             return False
@@ -184,12 +206,69 @@ class MaxAdapter(BasePlatformAdapter):
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        if self._polling_task is not None:
+            self._polling_task.cancel()
+            await asyncio.gather(self._polling_task, return_exceptions=True)
+            self._polling_task = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def _connect_polling(self) -> bool:
+        """Start dev/test long polling against MAX GET /updates."""
+        if self._running:
+            return True
+        self._get_client()
+        self._mark_connected()
+        self._polling_task = asyncio.create_task(self._poll_loop(), name="max-polling")
+        logger.warning(
+            "[MAX] MAX_TRANSPORT=polling enabled; this is intended for local development/testing. "
+            "Use webhook transport for production."
+        )
+        return True
+
+    async def _poll_loop(self) -> None:
+        backoff = 1.0
+        while self._running:
+            try:
+                updates = await self._poll_once(timeout=30)
+                if updates is None:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+                    continue
+                backoff = 1.0
+                for update in updates:
+                    await self._handle_update(update)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[MAX] polling error: %s", exc, exc_info=True)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    async def _poll_once(self, *, timeout: int = 30) -> Optional[list[Dict[str, Any]]]:
+        params: Dict[str, Any] = {"timeout": timeout}
+        if self._poll_marker is not None:
+            params["marker"] = self._poll_marker
+        response = await self._get_client().get(
+            f"{self.base_url}/updates",
+            params=params,
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            return []
+        marker = data.get("marker")
+        if marker is not None:
+            self._poll_marker = marker
+        updates = data.get("updates")
+        if not isinstance(updates, list):
+            return []
+        return [update for update in updates if isinstance(update, dict)]
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"status": "ok", "platform": "max"})  # type: ignore[union-attr]

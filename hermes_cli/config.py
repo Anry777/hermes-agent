@@ -56,6 +56,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "MAX_ALLOWED_USERS", "MAX_GROUP_ALLOWED_USERS", "MAX_ALLOW_ALL_USERS",
     "MAX_HOME_CHANNEL", "MAX_HOME_CHANNEL_NAME", "MAX_WEBHOOK_PUBLIC_URL", "MAX_WEBHOOK_SECRET",
     "MAX_WEBHOOK_HOST", "MAX_WEBHOOK_PORT", "MAX_WEBHOOK_PATH", "MAX_UPDATE_TYPES", "MAX_AUTO_SUBSCRIBE",
+    "MAX_TRANSPORT",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
@@ -1872,6 +1873,12 @@ OPTIONAL_ENV_VARS = {
     "MAX_AUTO_SUBSCRIBE": {
         "description": "Automatically POST /subscriptions at gateway startup when MAX_WEBHOOK_PUBLIC_URL is configured (true/false)",
         "prompt": "MAX Auto Subscribe",
+        "category": "messaging",
+        "advanced": True,
+    },
+    "MAX_TRANSPORT": {
+        "description": "MAX inbound transport: webhook (production default) or polling (local development/testing fallback)",
+        "prompt": "MAX Transport",
         "category": "messaging",
         "advanced": True,
     },

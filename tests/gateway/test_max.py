@@ -28,15 +28,23 @@ class FakeResponse:
 
 
 class RecordingClient:
-    def __init__(self):
+    def __init__(self, *, get_responses=None):
         self.posts = []
+        self.gets = []
         self.closed = False
+        self._get_responses = list(get_responses or [])
 
     async def post(self, url, *, params=None, json=None, headers=None):
         self.posts.append({"url": url, "params": params or {}, "json": json or {}, "headers": headers or {}})
         if url.endswith("/subscriptions"):
             return FakeResponse({"success": True})
         return FakeResponse({"message": {"id": f"msg-{len(self.posts)}"}})
+
+    async def get(self, url, *, params=None, headers=None):
+        self.gets.append({"url": url, "params": params or {}, "headers": headers or {}})
+        if self._get_responses:
+            return self._get_responses.pop(0)
+        return FakeResponse({"marker": None, "updates": []})
 
     async def aclose(self):
         self.closed = True
@@ -99,6 +107,7 @@ class TestMaxConfigLoading:
         monkeypatch.setenv("MAX_WEBHOOK_PORT", "8647")
         monkeypatch.setenv("MAX_UPDATE_TYPES", "message_created,bot_started")
         monkeypatch.setenv("MAX_AUTO_SUBSCRIBE", "true")
+        monkeypatch.setenv("MAX_TRANSPORT", "polling")
 
         config = GatewayConfig()
         _apply_env_overrides(config)
@@ -115,6 +124,7 @@ class TestMaxConfigLoading:
         assert platform_config.extra["webhook_port"] == 8647
         assert platform_config.extra["update_types"] == "message_created,bot_started"
         assert platform_config.extra["auto_subscribe"] is True
+        assert platform_config.extra["transport"] == "polling"
         assert platform_config.home_channel == HomeChannel(Platform.MAX, "777", "MAX Home")
         assert config.get_connected_platforms() == [Platform.MAX]
 
@@ -125,6 +135,17 @@ class TestMaxConfigLoading:
         assert check_max_requirements() is False
         monkeypatch.setenv("MAX_BOT_TOKEN", "max-token")
         assert check_max_requirements() is True
+
+    def test_polling_transport_does_not_require_aiohttp_webhook_dependency(self, monkeypatch):
+        from gateway.platforms import max as max_platform
+
+        monkeypatch.setenv("MAX_BOT_TOKEN", "max-token")
+        monkeypatch.setenv("MAX_TRANSPORT", "polling")
+        monkeypatch.setattr(max_platform, "AIOHTTP_AVAILABLE", False)
+        assert max_platform.check_max_requirements() is True
+
+        monkeypatch.setenv("MAX_TRANSPORT", "webhook")
+        assert max_platform.check_max_requirements() is False
 
 
 class TestMaxAdapter:
@@ -181,6 +202,48 @@ class TestMaxAdapter:
                 "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_poll_once_gets_official_updates_endpoint_and_advances_marker(self):
+        adapter = _make_adapter(token="max-token", transport="polling")
+        client = RecordingClient(get_responses=[FakeResponse({"marker": 42, "updates": [_message_update(update_id="poll-1")]})])
+        adapter._client = client
+
+        updates = await adapter._poll_once(timeout=1)
+
+        assert updates == [_message_update(update_id="poll-1")]
+        assert adapter._poll_marker == 42
+        assert client.gets == [
+            {
+                "url": "https://platform-api.max.ru/updates",
+                "params": {"timeout": 1},
+                "headers": {"Authorization": "max-token", "Content-Type": "application/json"},
+            }
+        ]
+
+        await adapter._poll_once(timeout=1)
+        assert client.gets[-1]["params"] == {"timeout": 1, "marker": 42}
+
+    @pytest.mark.asyncio
+    async def test_polling_updates_reuse_webhook_event_conversion_dedup_and_dispatch(self):
+        adapter = _make_adapter(token="max-token", transport="polling")
+        client = RecordingClient(get_responses=[FakeResponse({"marker": 100, "updates": [
+            _message_update(text="from polling", update_id="same"),
+            _message_update(text="from polling", update_id="same"),
+        ]})])
+        adapter._client = client
+        calls = []
+
+        async def handler(event):
+            calls.append((event.text, event.source.chat_id, event.source.user_id))
+
+        adapter.set_message_handler(handler)
+
+        for update in await adapter._poll_once(timeout=1):
+            await adapter._handle_update(update)
+        await _drain_adapter_tasks(adapter)
+
+        assert calls == [("from polling", "777", "123")]
 
     @pytest.mark.asyncio
     async def test_send_posts_text_to_chat_id_query_with_modern_body_fields(self):

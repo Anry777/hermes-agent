@@ -1307,6 +1307,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             ("MAX_WEBHOOK_PUBLIC_URL", "webhook_public_url"),
             ("MAX_WEBHOOK_SECRET", "webhook_secret"),
             ("MAX_UPDATE_TYPES", "update_types"),
+            ("MAX_TRANSPORT", "transport"),
         ):
             value = os.getenv(env_name, "").strip()
             if value:
