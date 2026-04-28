@@ -32,6 +32,7 @@ import { useSearchParams } from "react-router-dom";
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
+import { PluginSlot } from "@/plugins";
 
 function buildWsUrl(
   token: string,
@@ -100,11 +101,15 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }
 
-export default function ChatPage() {
+export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Exposed to the main metrics-sync effect so it can refit the terminal
+  // the moment `isActive` flips back to true (display:none → display:flex
+  // collapses the host's box, so ResizeObserver never fires on return).
+  const syncMetricsRef = useRef<(() => void) | null>(null);
   const [searchParams] = useSearchParams();
   // Lazy-init: the missing-token check happens at construction so the effect
   // body doesn't have to setState (React 19's set-state-in-effect rule).
@@ -115,10 +120,19 @@ export default function ChatPage() {
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [mobilePanelOpen, setMobilePanelOpen] = useState(false);
+  // Raw state for the mobile side-sheet + a derived value that force-
+  // closes whenever the chat tab isn't active.  The *derived* value is
+  // what side-effects (body-scroll lock, keydown listener, portal render)
+  // key on — that way switching to another tab triggers the effect's
+  // cleanup, releasing the scroll-lock on /sessions etc.  Returning to
+  // /chat re-runs the effect (derived flips back to true) and re-locks.
+  // Keying on the raw state would leak the body.overflow="hidden" across
+  // tabs because the dep wouldn't change on tab switch.
+  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
+  const mobilePanelOpen = isActive && mobilePanelOpenRaw;
   const { setEnd } = usePageHeader();
   const { t } = useI18n();
-  const closeMobilePanel = useCallback(() => setMobilePanelOpen(false), []);
+  const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const modelToolsLabel = useMemo(
     () => `${t.app.modelToolsSheetTitle} ${t.app.modelToolsSheetSubtitle}`,
     [t.app.modelToolsSheetSubtitle, t.app.modelToolsSheetTitle],
@@ -160,13 +174,19 @@ export default function ChatPage() {
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
     const onChange = (e: MediaQueryListEvent) => {
-      if (e.matches) setMobilePanelOpen(false);
+      if (e.matches) setMobilePanelOpenRaw(false);
     };
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
 
   useEffect(() => {
+    // When hidden (non-chat tab) we must not register the header button —
+    // another page owns the header's end slot at that point.
+    if (!isActive) {
+      setEnd(null);
+      return;
+    }
     if (!narrow) {
       setEnd(null);
       return;
@@ -174,7 +194,7 @@ export default function ChatPage() {
     setEnd(
       <button
         type="button"
-        onClick={() => setMobilePanelOpen(true)}
+        onClick={() => setMobilePanelOpenRaw(true)}
         className={cn(
           "inline-flex items-center gap-1.5 rounded border border-current/20",
           "px-2 py-1 text-[0.65rem] font-medium tracking-wide normal-case",
@@ -190,7 +210,7 @@ export default function ChatPage() {
       </button>,
     );
     return () => setEnd(null);
-  }, [narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -268,17 +288,17 @@ export default function ChatPage() {
       const payload = data.slice(semi + 1);
       if (payload === "?" || payload === "") return false; // read/clear — ignore
       try {
-        // atob returns a binary string (one byte per char); we need UTF-8
-        // decode so multi-byte codepoints (≥, →, emoji, CJK) round-trip
-        // correctly.  Without this step, the three UTF-8 bytes of `≥`
-        // would land in the clipboard as the three separate Latin-1
-        // characters `â‰¥`.
         const binary = atob(payload);
         const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
         const text = new TextDecoder("utf-8").decode(bytes);
-        navigator.clipboard.writeText(text).catch(() => {});
-      } catch {
-        // Malformed base64 — silently drop.
+        navigator.clipboard.writeText(text).catch((err) => {
+          // Most common reason: the Clipboard API requires a user gesture.
+          // This can fail when the OSC 52 response arrives outside the
+          // original keydown event's activation. Log to aid debugging.
+          console.warn("[dashboard clipboard] OSC 52 write failed:", err.message);
+        });
+      } catch (e) {
+        console.warn("[dashboard clipboard] malformed OSC 52 payload");
       }
       return true;
     });
@@ -289,16 +309,31 @@ export default function ChatPage() {
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
 
+      // Copy: Cmd+C on macOS, Ctrl+Shift+C on other platforms. Bare Ctrl+C
+      // is reserved for SIGINT to the TUI child — matches xterm / gnome-terminal /
+      // konsole / Windows Terminal. Ctrl+Shift+C only copies if a selection exists;
+      // without a selection it passes through to the TUI so agents can still
+      // react to the keypress.
+      // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
       const copyModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
       const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
 
       if (copyModifier && ev.key.toLowerCase() === "c") {
         const sel = term.getSelection();
         if (sel) {
-          navigator.clipboard.writeText(sel).catch(() => {});
+          // Direct writeText inside the keydown handler preserves the user
+          // gesture — async round-trips through OSC 52 can lose activation
+          // and fail with "Document is not focused".
+          navigator.clipboard.writeText(sel).catch((err) => {
+            console.warn("[dashboard clipboard] direct copy failed:", err.message);
+          });
+          // Clear xterm.js's highlight after copy (matches gnome-terminal).
+          term.clearSelection();
           ev.preventDefault();
           return false;
         }
+        // No selection → fall through so the TUI receives Ctrl+Shift+C
+        // (or the bare ev if the user used a different modifier).
       }
 
       if (pasteModifier && ev.key.toLowerCase() === "v") {
@@ -307,7 +342,9 @@ export default function ChatPage() {
           .then((text) => {
             if (text) term.paste(text);
           })
-          .catch(() => {});
+          .catch((err) => {
+            console.warn("[dashboard clipboard] paste failed:", err.message);
+          });
         ev.preventDefault();
         return false;
       }
@@ -374,6 +411,12 @@ export default function ChatPage() {
 
     let metricsDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncTerminalMetrics = () => {
+      // display:none hosts have clientWidth/Height = 0, which fit() turns
+      // into a 1x1 terminal.  Skip entirely while hidden; the visibility
+      // effect below runs another fit as soon as the tab is shown again.
+      if (!host.isConnected || host.clientWidth <= 0 || host.clientHeight <= 0) {
+        return;
+      }
       const w = terminalTierWidthPx(host);
       const nextSize = terminalFontSizeForWidth(w);
       const nextLh = terminalLineHeightForWidth(w);
@@ -404,6 +447,7 @@ export default function ChatPage() {
         wsRef.current.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
       }
     };
+    syncMetricsRef.current = syncTerminalMetrics;
 
     const scheduleSyncTerminalMetrics = () => {
       if (metricsDebounce) clearTimeout(metricsDebounce);
@@ -547,6 +591,7 @@ export default function ChatPage() {
 
     return () => {
       unmounting = true;
+      syncMetricsRef.current = null;
       onDataDisposable.dispose();
       onResizeDisposable.dispose();
       if (metricsDebounce) clearTimeout(metricsDebounce);
@@ -575,6 +620,51 @@ export default function ChatPage() {
     };
   }, [channel]);
 
+  // When the user returns to the chat tab (isActive: false → true), the
+  // terminal host just transitioned from display:none to display:flex.
+  // ResizeObserver won't fire on that kind of style-driven box change —
+  // xterm thinks its grid is still whatever it was when the tab was
+  // hidden (or 0×0, if it was hidden before first fit).  Force a refit
+  // after two animation frames so layout has committed.
+  //
+  // Focus handling: we only steal focus back into the terminal when
+  // nothing else inside ChatPage was holding it (typically the first
+  // activation after mount, where document.activeElement is <body>; or
+  // a return after the user had been typing in the terminal, where
+  // focus was already on the xterm textarea before the tab got hidden
+  // and has since fallen back to <body>).  If the user had clicked
+  // into the sidebar (model picker, tool-call entry) before switching
+  // tabs, we must not yank focus away from wherever they left it when
+  // they come back — that's a surprise and an a11y foot-gun.
+  useEffect(() => {
+    if (!isActive) return;
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      raf1 = 0;
+      raf2 = requestAnimationFrame(() => {
+        raf2 = 0;
+        syncMetricsRef.current?.();
+        const host = hostRef.current;
+        const active = typeof document !== "undefined"
+          ? document.activeElement
+          : null;
+        const focusIsElsewhereInChatPage =
+          active !== null &&
+          active !== document.body &&
+          host !== null &&
+          !host.contains(active);
+        if (!focusIsElsewhereInChatPage) {
+          termRef.current?.focus();
+        }
+      });
+    });
+    return () => {
+      if (raf1) cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
+    };
+  }, [isActive]);
+
   // Layout:
   //   outer flex column — sits inside the dashboard's content area
   //   row split — terminal pane (flex-1) + sidebar (fixed width, lg+)
@@ -594,6 +684,7 @@ export default function ChatPage() {
   // dashboard column uses `relative z-2`, which traps `position:fixed`
   // descendants below those layers (see Toast.tsx).
   const mobileModelToolsPortal =
+    isActive &&
     narrow &&
     portalRoot &&
     createPortal(
@@ -670,6 +761,7 @@ export default function ChatPage() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2 normal-case">
+      <PluginSlot name="chat:top" />
       {mobileModelToolsPortal}
 
       {banner && (
@@ -732,6 +824,7 @@ export default function ChatPage() {
           </div>
         )}
       </div>
+      <PluginSlot name="chat:bottom" />
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { Box, NoSelect, Text } from '@hermes/ink'
-import { memo, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { memo, type ReactNode, useEffect, useMemo, useState } from 'react'
 import spinners, { type BrailleSpinnerName } from 'unicode-animations'
 
 import { THINKING_COT_MAX } from '../config/limits.js'
@@ -16,12 +16,14 @@ import {
   widthByDepth
 } from '../lib/subagentTree.js'
 import {
+  boundedLiveRenderText,
   compactPreview,
   estimateTokensRough,
   fmtK,
   formatToolCall,
   parseToolTrailResultLine,
   pick,
+  splitToolDuration,
   thinkingPreview,
   toolTrailLabel
 } from '../lib/text.js'
@@ -392,10 +394,6 @@ function SubagentAccordion({
   const hasTools = item.tools.length > 0
   const noteRows = [...(summary ? [summary] : []), ...item.notes]
   const hasNotes = noteRows.length > 0
-  // `showChildren` only seeds the recursive `expanded` prop for nested
-  // subagents — it MUST NOT be OR-ed into the local section toggles, or
-  // expand-all permanently locks the inner chevrons open.
-  const showChildren = expanded || deep
   const noteColor = statusTone === 'error' ? t.color.error : statusTone === 'warn' ? t.color.warn : t.color.dim
 
   const sections: {
@@ -633,7 +631,12 @@ export const Thinking = memo(function Thinking({
   streaming?: boolean
   t: Theme
 }) {
-  const preview = useMemo(() => thinkingPreview(reasoning, mode, THINKING_COT_MAX), [mode, reasoning])
+  const preview = useMemo(() => {
+    const raw = thinkingPreview(reasoning, mode, THINKING_COT_MAX)
+
+    return mode === 'full' ? boundedLiveRenderText(raw) : raw
+  }, [mode, reasoning])
+
   const lines = useMemo(() => preview.split('\n').map(line => line.replace(/\t/g, '  ')), [preview])
 
   if (!preview && !active) {
@@ -646,22 +649,22 @@ export const Thinking = memo(function Thinking({
         {preview ? (
           mode === 'full' ? (
             lines.map((line, index) => (
-              <Text color={t.color.dim} dim key={index} wrap="wrap-trim">
+              <Text color={t.color.dim} key={index} wrap="wrap-trim">
                 {line || ' '}
                 {index === lines.length - 1 ? (
-                  <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
+                  <StreamCursor color={t.color.dim} streaming={streaming} visible={active} />
                 ) : null}
               </Text>
             ))
           ) : (
-            <Text color={t.color.dim} dim wrap="truncate-end">
+            <Text color={t.color.dim} wrap="truncate-end">
               {preview}
-              <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
+              <StreamCursor color={t.color.dim} streaming={streaming} visible={active} />
             </Text>
           )
         ) : (
-          <Text color={t.color.dim} dim>
-            <StreamCursor color={t.color.dim} dimColor streaming={streaming} visible={active} />
+          <Text color={t.color.dim}>
+            <StreamCursor color={t.color.dim} streaming={streaming} visible={active} />
           </Text>
         )}
       </Box>
@@ -681,6 +684,7 @@ interface Group {
 
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
+  commandOverride = false,
   detailsMode = 'collapsed',
   outcome = '',
   reasoningActive = false,
@@ -696,6 +700,7 @@ export const ToolTrail = memo(function ToolTrail({
   activity = []
 }: {
   busy?: boolean
+  commandOverride?: boolean
   detailsMode?: DetailsMode
   outcome?: string
   reasoningActive?: boolean
@@ -712,12 +717,12 @@ export const ToolTrail = memo(function ToolTrail({
 }) {
   const visible = useMemo(
     () => ({
-      thinking: sectionMode('thinking', detailsMode, sections),
-      tools: sectionMode('tools', detailsMode, sections),
-      subagents: sectionMode('subagents', detailsMode, sections),
-      activity: sectionMode('activity', detailsMode, sections)
+      thinking: sectionMode('thinking', detailsMode, sections, commandOverride),
+      tools: sectionMode('tools', detailsMode, sections, commandOverride),
+      subagents: sectionMode('subagents', detailsMode, sections, commandOverride),
+      activity: sectionMode('activity', detailsMode, sections, commandOverride)
     }),
-    [detailsMode, sections]
+    [commandOverride, detailsMode, sections]
   )
 
   const [now, setNow] = useState(() => Date.now())
@@ -788,7 +793,7 @@ export const ToolTrail = memo(function ToolTrail({
     if (parsed) {
       groups.push({
         color: parsed.mark === '✗' ? t.color.error : t.color.cornsilk,
-        content: parsed.detail ? parsed.call : `${parsed.call} ${parsed.mark}`,
+        content: parsed.call,
         details: [],
         key: `tr-${i}`,
         label: parsed.call
@@ -884,6 +889,21 @@ export const ToolTrail = memo(function ToolTrail({
   const delegateGroups = groups.filter(g => g.label.startsWith('Delegate Task'))
   const inlineDelegateKey = hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null
 
+  const toolLabel = (group: Group) => {
+    const { duration, label } = splitToolDuration(String(group.content))
+
+    return duration ? (
+      <>
+        {label}
+        <Text color={t.color.statusFg} dim>
+          {duration}
+        </Text>
+      </>
+    ) : (
+      group.content
+    )
+  }
+
   // ── Backstop: floating alerts when every panel is hidden ─────────
   //
   // Per-section overrides win over the global details_mode (they're computed
@@ -919,13 +939,22 @@ export const ToolTrail = memo(function ToolTrail({
   // hidden sections stay hidden so the override is honoured.
 
   const expandAll = () => {
-    if (visible.thinking !== 'hidden') setOpenThinking(true)
-    if (visible.tools !== 'hidden') setOpenTools(true)
+    if (visible.thinking !== 'hidden') {
+      setOpenThinking(true)
+    }
+
+    if (visible.tools !== 'hidden') {
+      setOpenTools(true)
+    }
+
     if (visible.subagents !== 'hidden') {
       setOpenSubagents(true)
       setDeepSubagents(true)
     }
-    if (visible.activity !== 'hidden') setOpenMeta(true)
+
+    if (visible.activity !== 'hidden') {
+      setOpenMeta(true)
+    }
   }
 
   const metaTone: 'dim' | 'error' | 'warn' = activity.some(i => i.tone === 'error')
@@ -1040,7 +1069,7 @@ export const ToolTrail = memo(function ToolTrail({
                   content={
                     <>
                       <Text color={t.color.amber}>● </Text>
-                      {group.content}
+                      {toolLabel(group)}
                     </>
                   }
                   rails={rails}

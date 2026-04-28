@@ -43,6 +43,7 @@ import yaml
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL, resolve_auth_store_path
+from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("ARCEEAI_API_KEY",),
         base_url_env_var="ARCEE_BASE_URL",
     ),
+    "gmi": ProviderConfig(
+        id="gmi",
+        name="GMI Cloud",
+        auth_type="api_key",
+        inference_base_url="https://api.gmi-serving.com/v1",
+        api_key_env_vars=("GMI_API_KEY",),
+        base_url_env_var="GMI_BASE_URL",
+    ),
     "minimax": ProviderConfig(
         id="minimax",
         name="MiniMax",
@@ -340,6 +349,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("XIAOMI_API_KEY",),
         base_url_env_var="XIAOMI_BASE_URL",
     ),
+    "tencent-tokenhub": ProviderConfig(
+        id="tencent-tokenhub",
+        name="Tencent TokenHub",
+        auth_type="api_key",
+        inference_base_url="https://tokenhub.tencentmaas.com/v1",
+        api_key_env_vars=("TOKENHUB_API_KEY",),
+        base_url_env_var="TOKENHUB_BASE_URL",
+    ),
     "ollama-cloud": ProviderConfig(
         id="ollama-cloud",
         name="Ollama Cloud",
@@ -355,6 +372,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
         api_key_env_vars=(),
         base_url_env_var="BEDROCK_BASE_URL",
+    ),
+    "azure-foundry": ProviderConfig(
+        id="azure-foundry",
+        name="Azure Foundry",
+        auth_type="api_key",
+        inference_base_url="",  # User-provided endpoint
+        api_key_env_vars=("AZURE_FOUNDRY_API_KEY",),
+        base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
 }
 
@@ -459,10 +484,26 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
+    from hermes_cli.config import get_env_value
     for env_var in pconfig.api_key_env_vars:
-        val = os.getenv(env_var, "").strip()
+        # Check both os.environ and ~/.hermes/.env file
+        val = (get_env_value(env_var) or "").strip()
         if has_usable_secret(val):
             return val, env_var
+
+    # Fallback: try credential pool (e.g. zai key stored via auth.json)
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool(provider_id)
+        if pool and pool.has_credentials():
+            entry = pool.peek()
+            if entry:
+                key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
+                key = str(key).strip()
+                if has_usable_secret(key):
+                    return key, f"credential_pool:{provider_id}"
+    except Exception:
+        pass
 
     return "", ""
 
@@ -798,7 +839,7 @@ def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, auth_file)
+        atomic_replace(tmp_path, auth_file)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:
@@ -1106,6 +1147,7 @@ def resolve_provider(
         "kimi-cn": "kimi-coding-cn", "moonshot-cn": "kimi-coding-cn",
         "step": "stepfun", "stepfun-coding-plan": "stepfun",
         "arcee-ai": "arcee", "arceeai": "arcee",
+        "gmi-cloud": "gmi", "gmicloud": "gmi",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
@@ -1118,6 +1160,8 @@ def resolve_provider(
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
+        "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
+        "tencent-cloud": "tencent-tokenhub", "tencentmaas": "tencent-tokenhub",
         "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
@@ -4246,10 +4290,10 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 )
 
             from hermes_cli.models import (
-                _PROVIDER_MODELS, get_pricing_for_provider,
+                get_curated_nous_model_ids, get_pricing_for_provider,
                 check_nous_free_tier, partition_nous_models_by_tier,
             )
-            model_ids = _PROVIDER_MODELS.get("nous", [])
+            model_ids = get_curated_nous_model_ids()
 
             print()
             unavailable_models: list = []

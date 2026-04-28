@@ -39,6 +39,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
+import { PluginSlot } from "@/plugins";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -227,7 +228,26 @@ export default function ConfigPage() {
   };
 
   const handleReset = () => {
-    if (defaults) setConfig(structuredClone(defaults));
+    if (!defaults || !config) return;
+    // Scope the reset to what the user is currently looking at:
+    //   - search mode → the matched fields
+    //   - form mode   → the active category's fields
+    // Resetting the whole config here was a footgun (issue reported by @ykmfb001):
+    // the button sits next to the category tabs and users reasonably assumed
+    // "reset this tab", not "wipe my entire config.yaml".
+    const scopedFields = isSearching ? searchMatchedFields : activeFields;
+    if (scopedFields.length === 0) return;
+    const scopeLabel = isSearching
+      ? t.config.searchResults
+      : prettyCategoryName(activeCategory);
+    const message = t.config.confirmResetScope.replace("{scope}", scopeLabel);
+    if (!window.confirm(message)) return;
+    let next: Record<string, unknown> = config;
+    for (const [key] of scopedFields) {
+      next = setNestedValue(next, key, getNestedValue(defaults, key));
+    }
+    setConfig(next);
+    showToast(t.config.resetScopeToast.replace("{scope}", scopeLabel), "success");
   };
 
   const handleExport = () => {
@@ -313,6 +333,7 @@ export default function ConfigPage() {
 
   return (
     <div className="flex flex-col gap-4">
+      <PluginSlot name="config:top" />
       <Toast toast={toast} />
 
       {/* ═══════════════ Header Bar ═══════════════ */}
@@ -331,9 +352,17 @@ export default function ConfigPage() {
             <Upload className="h-3.5 w-3.5" />
           </Button>
           <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={handleImport} />
-          <Button variant="ghost" size="sm" onClick={handleReset} title={t.config.resetDefaults} aria-label={t.config.resetDefaults}>
-            <RotateCcw className="h-3.5 w-3.5" />
-          </Button>
+          {!yamlMode && (() => {
+            const resetScopeLabel = isSearching
+              ? t.config.searchResults
+              : prettyCategoryName(activeCategory);
+            const resetTitle = t.config.resetScopeTooltip.replace("{scope}", resetScopeLabel);
+            return (
+              <Button variant="ghost" size="sm" onClick={handleReset} title={resetTitle} aria-label={resetTitle}>
+                <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            );
+          })()}
 
           <div className="w-px h-5 bg-border mx-1" />
 
@@ -505,6 +534,7 @@ export default function ConfigPage() {
           </div>
         </div>
       )}
+      <PluginSlot name="config:bottom" />
     </div>
   );
 }

@@ -6,7 +6,7 @@ Shows the status of all Hermes Agent components.
 
 import os
 import sys
-import subprocess
+import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -327,6 +327,7 @@ def show_status(args):
         "Weixin": ("WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL"),
         "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
         "QQBot": ("QQ_APP_ID", "QQBOT_HOME_CHANNEL"),
+        "Yuanbao": ("YUANBAO_APP_ID", "YUANBAO_HOME_CHANNEL"),
         "MAX": ("MAX_BOT_TOKEN", "MAX_HOME_CHANNEL"),
     }
     

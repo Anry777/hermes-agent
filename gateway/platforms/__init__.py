@@ -11,6 +11,7 @@ Each adapter handles:
 from .base import BasePlatformAdapter, MessageEvent, SendResult
 from .max import MaxAdapter
 from .qqbot import QQAdapter
+from .yuanbao import YuanbaoAdapter
 
 __all__ = [
     "BasePlatformAdapter",
@@ -18,4 +19,5 @@ __all__ = [
     "SendResult",
     "MaxAdapter",
     "QQAdapter",
+    "YuanbaoAdapter",
 ]

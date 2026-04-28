@@ -2725,6 +2725,24 @@ _PLATFORMS = [
         ],
     },
     {
+        "key": "yuanbao",
+        "label": "Yuanbao",
+        "emoji": "💎",
+        "token_var": "YUANBAO_APP_ID",
+        "setup_instructions": [
+            "1. Download the Yuanbao app from https://yuanbao.tencent.com/",
+            "2. In the app, go to PAI → My Bot and create a new bot",
+            "3. After the bot is created, copy the App ID and App Secret",
+            "4. Enter them below and Hermes will connect automatically over WebSocket",
+        ],
+        "vars": [
+            {"name": "YUANBAO_APP_ID", "prompt": "App ID", "password": False,
+             "help": "The App ID from your Yuanbao IM Bot credentials."},
+            {"name": "YUANBAO_APP_SECRET", "prompt": "App Secret", "password": True,
+             "help": "The App Secret (used for HMAC signing) from your Yuanbao IM Bot."},
+        ],
+    },
+    {
         "key": "max",
         "label": "MAX",
         "emoji": "💬",
@@ -3030,7 +3048,7 @@ def _setup_sms():
 def _setup_dingtalk():
     """Configure DingTalk — QR scan (recommended) or manual credential entry."""
     from hermes_cli.setup import (
-        prompt_choice, prompt_yes_no, print_info, print_success, print_warning,
+        prompt_choice, prompt_yes_no, print_success, print_warning,
     )
 
     dingtalk_platform = next(p for p in _PLATFORMS if p["key"] == "dingtalk")
@@ -3201,6 +3219,12 @@ def _setup_wecom():
 
     print()
     print_success("💬 WeCom configured!")
+
+
+def _setup_yuanbao():
+    """Configure Yuanbao via the standard platform setup."""
+    yuanbao_platform = next(p for p in _PLATFORMS if p["key"] == "yuanbao")
+    _setup_standard_platform(yuanbao_platform)
 
 
 def _is_service_installed() -> bool:
@@ -3575,7 +3599,6 @@ def _setup_qqbot():
     method_idx = prompt_choice("  How would you like to set up QQ Bot?", method_choices, 0)
 
     credentials = None
-    used_qr = False
 
     if method_idx == 0:
         # ── QR scan-to-configure ──
@@ -3586,8 +3609,6 @@ def _setup_qqbot():
             print()
             print_warning("  QQ Bot setup cancelled.")
             return
-        if credentials:
-            used_qr = True
         if not credentials:
             print_info("  QR setup did not complete. Continuing with manual input.")
 

@@ -1,8 +1,8 @@
 import { atom } from 'nanostores'
 
+import { MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
 import { DEFAULT_THEME } from '../theme.js'
-import { MOUSE_TRACKING } from '../config/env.js'
 
 import type { UiState } from './interfaces.js'
 
@@ -11,6 +11,7 @@ const buildUiState = (): UiState => ({
   busy: false,
   compact: false,
   detailsMode: 'collapsed',
+  detailsModeCommandOverride: false,
   info: null,
   inlineDiffs: true,
   mouseTracking: MOUSE_TRACKING,
