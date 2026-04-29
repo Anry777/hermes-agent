@@ -192,7 +192,9 @@ Delete a stored response.
 
 ### GET /v1/models
 
-Lists the agent as an available model. The advertised model name defaults to the [profile](/docs/user-guide/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.
+In the default **agent mode**, lists the agent as an available model. The advertised model name defaults to the [profile](/docs/user-guide/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.
+
+In **provider proxy mode**, lists the explicit proxy model catalog from `provider_proxy.models`; each returned model id is routable via `POST /v1/chat/completions`.
 
 ### GET /health
 
@@ -250,11 +252,55 @@ Resume a previously paused job.
 
 Trigger the job to run immediately, out of schedule.
 
+## Provider Proxy Mode
+
+By default, the API server runs in **agent mode**: requests go through `AIAgent`, so Hermes applies its normal system prompt, tools, memory, skills, sessions, and multi-step agent loop.
+
+For deployments that need a raw OpenAI-compatible gateway to configured provider credentials, enable **provider proxy mode**. In this mode Hermes bypasses `AIAgent` and routes requests directly to the configured provider/model target. Hermes still owns endpoint authentication, provider credential resolution, and model allowlisting, but it does not execute tools or inject Hermes prompts.
+
+Example service profile configuration:
+
+```yaml
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8642
+      key: change-me
+      mode: provider_proxy
+      provider_proxy:
+        default_model: openai-codex/gpt-5.4
+        require_explicit_model: false
+        models:
+          - id: openai-codex/gpt-5.4
+            provider: openai-codex
+            model: gpt-5.4
+          - id: openai-codex/gpt-5.4-mini
+            provider: openai-codex
+            model: gpt-5.4-mini
+          - id: openrouter/anthropic/claude-sonnet-4.5
+            provider: openrouter
+            model: anthropic/claude-sonnet-4.5
+```
+
+Run the gateway from the service profile:
+
+```bash
+hermes --profile provider-gateway gateway
+```
+
+Provider proxy mode intentionally uses an explicit catalog. Hermes does not expose every credential or every model found in `auth.json` automatically. Each public model id must map to a configured provider/model target.
+
+Initial support covers non-streaming `POST /v1/chat/completions`. OpenAI-compatible providers use a pass-through chat-completions backend; Responses-backed providers such as `openai-codex` use a compatibility adapter. Streaming proxy support is disabled unless explicitly added in a later release.
+
 ## System Prompt Handling
 
-When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API), hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.
+When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API) in default agent mode, hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.
 
-This means you can customize behavior per-frontend without losing capabilities:
+In provider proxy mode, system/developer/user/assistant/tool messages are forwarded to the provider adapter without Hermes' agent prompt, skills, memory, or tool execution.
+
+In agent mode, this means you can customize behavior per-frontend without losing capabilities:
 - Open WebUI system prompt: "You are a Python expert. Always include type hints."
 - The agent still has terminal, file tools, web search, memory, etc.
 
@@ -285,14 +331,23 @@ The default bind address (`127.0.0.1`) is for local-only use. Browser access is 
 | `API_SERVER_HOST` | `127.0.0.1` | Bind address (localhost only by default) |
 | `API_SERVER_KEY` | _(none)_ | Bearer token for auth |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
-| `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models` in agent mode. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_MODE` | `agent` | Set to `provider_proxy` to enable provider proxy mode. Use config.yaml for the proxy model catalog. |
 
 ### config.yaml
 
 ```yaml
-# Not yet supported — use environment variables.
-# config.yaml support coming in a future release.
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8642
+      key: change-me
+      model_name: hermes-agent
 ```
+
+For provider proxy mode, set `extra.mode: provider_proxy` and add the `provider_proxy.models` catalog shown above.
 
 ## Security Headers
 
@@ -369,7 +424,7 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
 - **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
-- **Model field is cosmetic** — the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml.
+- **Model field in agent mode is cosmetic** — in default agent mode the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml. In provider proxy mode, `model` must match a configured `provider_proxy.models` catalog entry and controls routing.
 
 ## Proxy Mode
 

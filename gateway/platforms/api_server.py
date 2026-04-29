@@ -579,6 +579,20 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        env_mode = os.getenv("API_SERVER_MODE", "").strip().lower()
+        if env_mode and "mode" not in extra:
+            extra = {**extra, "mode": env_mode}
+        self._mode: str = str(extra.get("mode") or "agent").strip().lower() or "agent"
+        self._provider_proxy = None
+        try:
+            from gateway.api_server_provider_proxy import APIServerProviderProxy
+            self._provider_proxy = APIServerProviderProxy.from_extra(extra)
+            if self._provider_proxy is not None:
+                self._mode = "provider_proxy"
+        except Exception as exc:
+            if self._mode == "provider_proxy":
+                raise
+            logger.debug("Provider proxy mode unavailable: %s", exc)
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -779,6 +793,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
+            "mode": self._mode,
             "gateway_state": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
             "active_agents": runtime.get("active_agents", 0),
@@ -788,10 +803,12 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — return hermes-agent as an available model."""
+        """GET /v1/models — return available agent or provider-proxy models."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return await self._provider_proxy.handle_models(request)
 
         return web.json_response({
             "object": "list",
@@ -813,6 +830,8 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return await self._provider_proxy.handle_chat_completions(request)
 
         # Parse request body
         try:
@@ -1676,6 +1695,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return web.json_response(
+                _openai_error(
+                    "The Responses API is not supported in provider_proxy mode yet",
+                    code="unsupported_operation",
+                ),
+                status=400,
+            )
 
         # Parse request body
         try:
@@ -2344,6 +2371,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return web.json_response(
+                _openai_error(
+                    "Agent runs are not supported in provider_proxy mode",
+                    code="unsupported_operation",
+                ),
+                status=400,
+            )
 
         # Enforce concurrency limit
         if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
