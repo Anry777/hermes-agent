@@ -14,6 +14,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 try:
@@ -349,6 +350,16 @@ class APIServerProviderProxy:
             for msg in messages
             if isinstance(msg, dict) and msg.get("role") in {"system", "developer"}
         ).strip()
+        if not instructions:
+            # Codex Responses requires a non-empty instructions field even for
+            # plain Chat Completions requests that contain only user messages.
+            # Keep the fallback neutral so provider_proxy remains a raw-ish
+            # compatibility bridge instead of injecting Hermes agent identity.
+            instructions = str(
+                spec.request_defaults.get("instructions")
+                or body.get("instructions")
+                or "You are a helpful assistant."
+            ).strip()
         payload_messages = [
             msg for msg in messages
             if not (isinstance(msg, dict) and msg.get("role") in {"system", "developer"})
@@ -364,15 +375,29 @@ class APIServerProviderProxy:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = body.get("tool_choice", "auto")
-        if body.get("max_tokens") is not None:
+        # ChatGPT's Codex backend rejects max_output_tokens on its streaming
+        # compatibility endpoint, while standard Responses-compatible backends
+        # and tests expect the Chat Completions token limit to be mapped.
+        is_chatgpt_codex_backend = "chatgpt.com/backend-api/codex" in target.base_url
+        if not is_chatgpt_codex_backend and body.get("max_tokens") is not None:
             payload["max_output_tokens"] = body.get("max_tokens")
-        if body.get("max_completion_tokens") is not None:
+        if not is_chatgpt_codex_backend and body.get("max_completion_tokens") is not None:
             payload["max_output_tokens"] = body.get("max_completion_tokens")
 
         def _call() -> Dict[str, Any]:
             client = self._create_openai_client(target)
             try:
-                response = client.responses.create(**payload)
+                # The ChatGPT Codex backend requires streaming Responses API
+                # requests, but provider_proxy exposes a non-streaming
+                # Chat Completions response to callers.  Stream internally,
+                # collect the terminal response, then normalize it.
+                stream_payload = dict(payload)
+                stream_payload["stream"] = True
+                stream_or_response = client.responses.create(**stream_payload)
+                if hasattr(stream_or_response, "output") or not hasattr(stream_or_response, "__iter__"):
+                    response = stream_or_response
+                else:
+                    response = self._collect_streaming_response(stream_or_response)
                 normalized = ResponsesApiTransport().normalize_response(response)
                 return _chat_completion_from_normalized(spec.public_id, normalized, response)
             finally:
@@ -384,3 +409,54 @@ class APIServerProviderProxy:
                         pass
 
         return await asyncio.get_running_loop().run_in_executor(None, _call)
+
+    @staticmethod
+    def _collect_streaming_response(stream_or_response: Any) -> Any:
+        terminal_response = None
+        collected_output_items: List[Any] = []
+        collected_text_deltas: List[str] = []
+        try:
+            for event in stream_or_response:
+                event_type = getattr(event, "type", None)
+                if not event_type and isinstance(event, dict):
+                    event_type = event.get("type")
+                if event_type == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    if item is None and isinstance(event, dict):
+                        item = event.get("item")
+                    if item is not None:
+                        collected_output_items.append(item)
+                elif event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", "")
+                    if not delta and isinstance(event, dict):
+                        delta = event.get("delta", "")
+                    if delta:
+                        collected_text_deltas.append(str(delta))
+                elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                    terminal_response = getattr(event, "response", None)
+                    if terminal_response is None and isinstance(event, dict):
+                        terminal_response = event.get("response")
+                    if terminal_response is not None:
+                        break
+        finally:
+            close_fn = getattr(stream_or_response, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+        if terminal_response is None:
+            raise RuntimeError("Responses stream did not emit a terminal response")
+        output = getattr(terminal_response, "output", None)
+        if isinstance(output, list) and not output:
+            if collected_output_items:
+                terminal_response.output = list(collected_output_items)
+            elif collected_text_deltas:
+                terminal_response.output = [SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="".join(collected_text_deltas))],
+                )]
+        return terminal_response
