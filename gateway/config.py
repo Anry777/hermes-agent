@@ -598,8 +598,18 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                if "free_response_chats" in platform_cfg:
+                    bridged["free_response_chats"] = platform_cfg["free_response_chats"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if "allowed_users" in platform_cfg:
+                    bridged["allowed_users"] = platform_cfg["allowed_users"]
+                if "group_allowed_chats" in platform_cfg:
+                    bridged["group_allowed_chats"] = platform_cfg["group_allowed_chats"]
+                if "reply_triggers" in platform_cfg:
+                    bridged["reply_triggers"] = platform_cfg["reply_triggers"]
+                if "allow_reply_triggers" in platform_cfg:
+                    bridged["allow_reply_triggers"] = platform_cfg["allow_reply_triggers"]
                 if "dm_policy" in platform_cfg:
                     bridged["dm_policy"] = platform_cfg["dm_policy"]
                 if "allow_from" in platform_cfg:
@@ -608,6 +618,25 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_policy"] = platform_cfg["group_policy"]
                 if "group_allow_from" in platform_cfg:
                     bridged["group_allow_from"] = platform_cfg["group_allow_from"]
+                if plat == Platform.MAX:
+                    for yaml_key in (
+                        "base_url",
+                        "bot_user_id",
+                        "bot_username",
+                        "webhook_host",
+                        "webhook_port",
+                        "webhook_path",
+                        "webhook_public_url",
+                        "update_types",
+                        "transport",
+                        "text_format",
+                        "poll_timeout",
+                        "poll_idle_sleep",
+                        "auto_subscribe",
+                        "allow_all_users",
+                    ):
+                        if yaml_key in platform_cfg:
+                            bridged[yaml_key] = platform_cfg[yaml_key]
                 if plat in (Platform.DISCORD, Platform.SLACK) and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:
@@ -704,6 +733,19 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_REQUIRE_MENTION"] = str(telegram_cfg["require_mention"]).lower()
                 if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
                     os.environ["TELEGRAM_MENTION_PATTERNS"] = json.dumps(telegram_cfg["mention_patterns"])
+                if "allowed_users" in telegram_cfg and not os.getenv("TELEGRAM_ALLOWED_USERS"):
+                    allowed = telegram_cfg["allowed_users"]
+                    if isinstance(allowed, list):
+                        allowed = ",".join(str(v) for v in allowed)
+                    os.environ["TELEGRAM_ALLOWED_USERS"] = str(allowed)
+                if "home_channel" in telegram_cfg and not os.getenv("TELEGRAM_HOME_CHANNEL"):
+                    os.environ["TELEGRAM_HOME_CHANNEL"] = str(telegram_cfg["home_channel"])
+                if "home_channel_name" in telegram_cfg and not os.getenv("TELEGRAM_HOME_CHANNEL_NAME"):
+                    os.environ["TELEGRAM_HOME_CHANNEL_NAME"] = str(telegram_cfg["home_channel_name"])
+                if "reply_triggers" in telegram_cfg and not os.getenv("TELEGRAM_REPLY_TRIGGERS"):
+                    os.environ["TELEGRAM_REPLY_TRIGGERS"] = str(telegram_cfg["reply_triggers"]).lower()
+                if "allow_reply_triggers" in telegram_cfg and not os.getenv("TELEGRAM_REPLY_TRIGGERS"):
+                    os.environ["TELEGRAM_REPLY_TRIGGERS"] = str(telegram_cfg["allow_reply_triggers"]).lower()
                 frc = telegram_cfg.get("free_response_chats")
                 if frc is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
                     if isinstance(frc, list):
@@ -733,6 +775,45 @@ def load_gateway_config() -> GatewayConfig:
                         extra = {}
                         plat_data["extra"] = extra
                     extra["disable_link_previews"] = telegram_cfg["disable_link_previews"]
+
+            # MAX settings → env vars for legacy authorization/check paths.
+            # Secrets (MAX_BOT_TOKEN, MAX_WEBHOOK_SECRET) should still live in .env.
+            max_cfg = yaml_cfg.get("max", {})
+            if isinstance(max_cfg, dict):
+                def _set_max_env(yaml_key: str, env_key: str, *, as_bool: bool = False) -> None:
+                    if yaml_key not in max_cfg or os.getenv(env_key):
+                        return
+                    value = max_cfg[yaml_key]
+                    if isinstance(value, list):
+                        value = ",".join(str(v) for v in value)
+                    elif as_bool:
+                        value = str(value).lower()
+                    os.environ[env_key] = str(value)
+
+                for yaml_key, env_key in (
+                    ("allowed_users", "MAX_ALLOWED_USERS"),
+                    ("group_allowed_users", "MAX_GROUP_ALLOWED_USERS"),
+                    ("transport", "MAX_TRANSPORT"),
+                    ("base_url", "MAX_BASE_URL"),
+                    ("bot_user_id", "MAX_BOT_USER_ID"),
+                    ("bot_username", "MAX_BOT_USERNAME"),
+                    ("webhook_host", "MAX_WEBHOOK_HOST"),
+                    ("webhook_port", "MAX_WEBHOOK_PORT"),
+                    ("webhook_path", "MAX_WEBHOOK_PATH"),
+                    ("webhook_public_url", "MAX_WEBHOOK_PUBLIC_URL"),
+                    ("update_types", "MAX_UPDATE_TYPES"),
+                    ("text_format", "MAX_TEXT_FORMAT"),
+                    ("poll_timeout", "MAX_POLL_TIMEOUT"),
+                    ("poll_idle_sleep", "MAX_POLL_IDLE_SLEEP"),
+                    ("home_channel", "MAX_HOME_CHANNEL"),
+                    ("home_channel_name", "MAX_HOME_CHANNEL_NAME"),
+                ):
+                    _set_max_env(yaml_key, env_key)
+                for yaml_key, env_key in (
+                    ("allow_all_users", "MAX_ALLOW_ALL_USERS"),
+                    ("auto_subscribe", "MAX_AUTO_SUBSCRIBE"),
+                ):
+                    _set_max_env(yaml_key, env_key, as_bool=True)
 
             whatsapp_cfg = yaml_cfg.get("whatsapp", {})
             if isinstance(whatsapp_cfg, dict):

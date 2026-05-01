@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
-def _make_adapter(require_mention=None, free_response_chats=None, mention_patterns=None, ignored_threads=None):
+def _make_adapter(require_mention=None, free_response_chats=None, mention_patterns=None, ignored_threads=None, reply_triggers=None):
     from gateway.platforms.telegram import TelegramAdapter
 
     extra = {}
@@ -17,6 +17,8 @@ def _make_adapter(require_mention=None, free_response_chats=None, mention_patter
         extra["mention_patterns"] = mention_patterns
     if ignored_threads is not None:
         extra["ignored_threads"] = ignored_threads
+    if reply_triggers is not None:
+        extra["reply_triggers"] = reply_triggers
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -36,13 +38,16 @@ def _group_message(
     chat_id=-100,
     thread_id=None,
     reply_to_bot=False,
+    reply_to_user=None,
     entities=None,
     caption=None,
     caption_entities=None,
 ):
     reply_to_message = None
     if reply_to_bot:
-        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999))
+        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999, is_bot=True))
+    elif reply_to_user is not None:
+        reply_to_message = SimpleNamespace(from_user=reply_to_user)
     return SimpleNamespace(
         text=text,
         caption=caption,
@@ -75,6 +80,32 @@ def test_group_messages_can_be_opened_via_config():
 
     assert adapter._should_process_message(_group_message("hello everyone")) is True
 
+
+
+
+def test_group_reply_trigger_can_be_disabled_for_noisy_multi_bot_chats():
+    adapter = _make_adapter(require_mention=True, reply_triggers=False)
+
+    assert adapter._should_process_message(_group_message("replying", reply_to_bot=True)) is False
+    assert adapter._should_process_message(
+        _group_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_direct_only_without_reply_trigger_ignores_plain_replies_in_target_group():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=[],
+        mention_patterns=[r"^\s*(Цезарь|Cesair)[,!:：]?\b"],
+        reply_triggers=False,
+    )
+
+    assert adapter._should_process_message(
+        _group_message("тебя не спрашивали", chat_id=-5283179051, reply_to_bot=True)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("Цезарь, ответь", chat_id=-5283179051)
+    ) is True
 
 def test_group_messages_can_require_direct_trigger_via_config():
     adapter = _make_adapter(require_mention=True)
@@ -117,11 +148,118 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
 
 
-def test_free_response_chats_bypass_mention_requirement():
+def test_free_response_chats_allow_ambient_non_questions_without_hijacking_questions():
     adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
 
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
+    assert adapter._should_process_message(_group_message("обычный разговор без вопроса", chat_id=-200)) is True
+    assert adapter._should_process_message(_group_message("кто я?", chat_id=-200)) is False
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+
+def test_free_response_chats_ignore_messages_addressed_to_other_bot():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+
+    other_text = "@other_bot посмотри"
+    assert adapter._should_process_message(
+        _group_message(
+            other_text,
+            chat_id=-200,
+            entities=[_mention_entity(other_text, "@other_bot")],
+        )
+    ) is False
+
+    other_command = "/status@other_bot"
+    assert adapter._should_process_message(
+        _group_message(
+            other_command,
+            chat_id=-200,
+            entities=[_bot_command_entity(other_command, other_command)],
+        ),
+        is_command=True,
+    ) is False
+
+
+
+
+def test_explicit_other_mention_beats_local_wake_word_and_reply_context():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        mention_patterns=[r"^\s*(Цезарь|Cesair)[,!:：]?\b"],
+    )
+
+    text = "@DashaHermesBot Цезарь, вот и сиди"
+    assert adapter._should_process_message(
+        _group_message(
+            text,
+            chat_id=-200,
+            reply_to_bot=True,
+            entities=[_mention_entity(text, "@DashaHermesBot")],
+        )
+    ) is False
+
+def test_free_response_chats_still_accept_direct_mentions_and_replies():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+
+    text = "@hermes_bot посмотри"
+    assert adapter._should_process_message(
+        _group_message(text, chat_id=-200, entities=[_mention_entity(text)])
+    ) is True
+    assert adapter._should_process_message(_group_message("обычный reply", chat_id=-200, reply_to_bot=True)) is True
+
+
+def test_reply_context_does_not_override_fresh_addressing_to_other_bot():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+
+    other_mention = "@other_bot посмотри"
+    assert adapter._should_process_message(
+        _group_message(
+            other_mention,
+            chat_id=-200,
+            reply_to_bot=True,
+            entities=[_mention_entity(other_mention, "@other_bot")],
+        )
+    ) is False
+
+    assert adapter._should_process_message(
+        _group_message("Борис, скажи кто я", chat_id=-200, reply_to_bot=True)
+    ) is False
+
+
+def test_free_response_chats_ignore_replies_to_other_bots():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+
+    assert adapter._should_process_message(
+        _group_message(
+            "да, посмотри",
+            chat_id=-200,
+            reply_to_user=SimpleNamespace(id=12345, is_bot=True),
+        )
+    ) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "обычный reply человеку",
+            chat_id=-200,
+            reply_to_user=SimpleNamespace(id=54321, is_bot=False),
+        )
+    ) is True
+
+
+def test_free_response_chats_ignore_generic_leading_vocative_without_name_blacklist():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        mention_patterns=[r"^\s*(Федя|Фёдор|Федор)[,:]?\b"],
+    )
+
+    assert adapter._should_process_message(_group_message("Борис, скажи кто я", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("Маша, как дела?", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("обычное сообщение", chat_id=-200)) is True
+    assert adapter._should_process_message(_group_message("Федя, ты тут?", chat_id=-200)) is True
+    assert adapter._should_process_message(
+        _group_message("@hermes_bot Борис тут?", chat_id=-200, entities=[_mention_entity("@hermes_bot Борис тут?")])
+    ) is True
 
 
 def test_ignored_threads_drop_group_messages_before_other_gates():
@@ -153,6 +291,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     (hermes_home / "config.yaml").write_text(
         "telegram:\n"
         "  require_mention: true\n"
+        "  reply_triggers: false\n"
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
