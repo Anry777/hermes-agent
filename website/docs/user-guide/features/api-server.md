@@ -196,7 +196,9 @@ Delete a stored response.
 
 ### GET /v1/models
 
-Lists the agent as an available model. The advertised model name defaults to the [profile](/user-guide/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.
+In the default **agent mode**, lists the agent as an available model. The advertised model name defaults to the [profile](/docs/user-guide/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.
+
+In **provider proxy mode**, lists the explicit proxy model catalog from `provider_proxy.models`; each returned model id is routable via `POST /v1/chat/completions`.
 
 ### GET /v1/capabilities
 
@@ -372,11 +374,81 @@ X-Hermes-Session-Key: agent:main:webui:dm:user-42
 
 Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and the value is echoed back on responses (JSON + SSE). `/v1/capabilities` advertises support via `"session_key_header": "X-Hermes-Session-Key"`. Without the key, Honcho's `per-session` strategy produces a different scope per `session_id` — exactly the behavior Hermes had before.
 
+## Provider Proxy Mode
+
+By default, the API server runs in **agent mode**: requests go through `AIAgent`, so Hermes applies its normal system prompt, tools, memory, skills, sessions, and multi-step agent loop.
+
+For deployments that need a raw OpenAI-compatible gateway to configured provider credentials, enable **provider proxy mode**. In this mode Hermes bypasses `AIAgent` and routes requests directly to the configured provider/model target. Hermes still owns endpoint authentication, provider credential resolution, and model allowlisting, but it does not execute tools or inject Hermes prompts.
+
+Example service profile configuration:
+
+```yaml
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8642
+      key: change-me
+      mode: provider_proxy
+      provider_proxy:
+        default_model: gpt-5.4
+        require_explicit_model: false
+        allow_streaming: true
+        models:
+          - id: gpt-5.4
+            provider: openai-codex
+            model: gpt-5.4
+          - id: gpt-5.4-mini
+            provider: openai-codex
+            model: gpt-5.4-mini
+          - id: openrouter/anthropic/claude-sonnet-4.5
+            provider: openrouter
+            model: anthropic/claude-sonnet-4.5
+```
+
+Run the gateway from the service profile:
+
+```bash
+hermes --profile provider-gateway gateway
+```
+
+Provider proxy mode intentionally uses an explicit catalog. Hermes does not expose every credential or every model found in `auth.json` automatically. Each public model id must map to a configured provider/model target.
+
+Provider proxy supports both non-streaming and streaming `POST /v1/chat/completions` when `allow_streaming: true` is set. OpenAI-compatible providers use a pass-through chat-completions backend; Responses-backed providers such as `openai-codex` use a compatibility adapter that converts Responses streaming events to OpenAI Chat Completions SSE. The compatibility path preserves OpenAI-style `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, `role: tool` results, and inline `image_url` / `input_image` content parts. For ChatGPT Codex-backed targets, the adapter also maps OpenAI-compatible `reasoning_effort` to Responses `reasoning.effort` and drops sampling parameters that backend rejects, such as `temperature` and `top_p`. Uploaded files (`file`, `input_file`, `file_id`) remain unsupported and return `400 unsupported_content_type`. For IDEs such as RooCode, expose the exact public model ids you want users to select (for example `gpt-5.4`) in the explicit catalog.
+
+Provider proxy mode supports a second opt-in runtime contract for clients that speak the OpenAI Responses wire API directly, such as Codex-style clients configured with `wire_api = "responses"`. Use `extra.mode: codex_responses_proxy` in a separate service profile when you want Hermes to act as a local Codex OAuth bridge instead of a Chat Completions compatibility gateway:
+
+```yaml
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8643
+      key: change-me
+      mode: codex_responses_proxy
+      codex_responses_proxy:
+        default_model: gpt-5.4
+        provider: openai-codex
+        model_discovery: live
+        allow_models:
+          - '^gpt-5\\.'
+          - '^codex-'
+        deny_models:
+          - '.*image.*'
+          - '.*video.*'
+```
+
+In `codex_responses_proxy` mode, `GET /v1/models` can query the live Codex model catalog and apply the configured allow/deny filters. `POST /v1/responses` is forwarded to the `openai-codex` Responses backend with the caller's body preserved as much as possible. `stream: true` returns Responses SSE events (`response.created`, `response.output_text.delta`, `response.completed`, etc.), not Chat Completions chunks. Hermes still enforces the local API-server bearer token and resolves Codex OAuth credentials internally, but it does not create an `AIAgent`, inject Hermes prompts, run Hermes tools, write sessions, or write memory. Keep this mode on a separate profile/port from `provider_proxy` so Chat Completions clients and Responses-native clients do not share incompatible `/v1/models` and streaming contracts.
+
 ## System Prompt Handling
 
-When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API), hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.
+When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API) in default agent mode, hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.
 
-This means you can customize behavior per-frontend without losing capabilities:
+In provider proxy mode, system/developer/user/assistant/tool messages are forwarded to the provider adapter without Hermes' agent prompt, skills, memory, or tool execution.
+
+In agent mode, this means you can customize behavior per-frontend without losing capabilities:
 - Open WebUI system prompt: "You are a Python expert. Always include type hints."
 - The agent still has terminal, file tools, web search, memory, etc.
 
@@ -405,14 +477,23 @@ The API server gives full access to hermes-agent's toolset, **including terminal
 | `API_SERVER_HOST` | `127.0.0.1` | Bind address (localhost only by default) |
 | `API_SERVER_KEY` | _(required)_ | Bearer token for auth |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
-| `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models` in agent mode. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_MODE` | `agent` | Set to `provider_proxy` for explicit Chat Completions proxy mode or `codex_responses_proxy` for a Responses-native Codex OAuth bridge. Use config.yaml for proxy model policy. |
 
 ### config.yaml
 
 ```yaml
-# Not yet supported — use environment variables.
-# config.yaml support coming in a future release.
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8642
+      key: change-me
+      model_name: hermes-agent
 ```
+
+For provider proxy mode, set `extra.mode: provider_proxy` and add the `provider_proxy.models` catalog shown above. For a Responses-native Codex bridge, set `extra.mode: codex_responses_proxy` and configure `codex_responses_proxy` in a dedicated profile.
 
 ## Security Headers
 
@@ -494,7 +575,7 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
 - **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
-- **Model field is cosmetic** — the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml.
+- **Model field in agent mode is cosmetic** — in default agent mode the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml. In `provider_proxy` mode, `model` must match a configured `provider_proxy.models` catalog entry and controls routing. In `codex_responses_proxy` mode, `model` is forwarded to the Codex Responses backend after allow/deny filters.
 
 ## Proxy Mode
 

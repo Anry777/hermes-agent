@@ -103,8 +103,7 @@ OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from agent.process_bootstrap import build_keepalive_http_client
-from hermes_cli.config import get_hermes_home
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, resolve_auth_store_path
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
@@ -160,6 +159,7 @@ def _openai_http_client_kwargs(
     base_url: Optional[str],
     *,
     async_mode: bool = False,
+    provider_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
     client = build_keepalive_http_client(
@@ -169,11 +169,23 @@ def _openai_http_client_kwargs(
     )
     if client is None:
         return {}
+    if provider_id:
+        from agent.process_bootstrap import install_provider_request_header_filter
+
+        install_provider_request_header_filter(
+            client,
+            provider_id,
+            async_mode=async_mode,
+        )
     return {"http_client": client}
 
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
-    kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
+    provider_id = kwargs.pop("_provider_id", None)
+    kwargs = {
+        **_openai_http_client_kwargs(base_url, provider_id=provider_id),
+        **kwargs,
+    }
     # Hermes owns auxiliary retry + provider/model fallback policy (the
     # same-provider transient retry in call_llm plus the except-chain
     # fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
@@ -650,8 +662,6 @@ _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 _NOUS_MODEL = "google/gemini-3-flash-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-_AUTH_JSON_PATH = get_hermes_home() / "auth.json"
-
 # Codex OAuth endpoint used when a caller explicitly requests
 # provider="openai-codex".  There is deliberately no hardcoded default
 # model: the set of models OpenAI accepts on this endpoint for
@@ -1582,9 +1592,10 @@ def _read_nous_auth() -> Optional[dict]:
         }
 
     try:
-        if not _AUTH_JSON_PATH.is_file():
+        auth_path = resolve_auth_store_path()
+        if not auth_path.is_file():
             return None
-        data = json.loads(_AUTH_JSON_PATH.read_text())
+        data = json.loads(auth_path.read_text())
         if data.get("active_provider") != "nous":
             return None
         provider = data.get("providers", {}).get("nous", {})
@@ -1761,17 +1772,16 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
 def _read_codex_access_token() -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
-    If a credential pool exists but currently has no selectable runtime entry
-    (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    If a credential pool exists but currently has no selectable runtime entry,
+    do not bypass its cooldown/exhaustion state through the legacy singleton.
+    The persisted singleton is only a migration fallback when no pool exists.
     """
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
+        return None
 
     try:
         from hermes_cli.auth import _read_codex_tokens
@@ -1868,7 +1878,12 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             _merged_aux = _apply_user_default_headers(extra.get("default_headers"))
             if _merged_aux:
                 extra["default_headers"] = _merged_aux
-            _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
+            _client = _create_openai_client(
+                api_key=api_key,
+                base_url=base_url,
+                _provider_id=provider_id,
+                **extra,
+            )
             _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
             return _client, model
 
@@ -1908,7 +1923,12 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         _merged_aux2 = _apply_user_default_headers(extra.get("default_headers"))
         if _merged_aux2:
             extra["default_headers"] = _merged_aux2
-        _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
+        _client = _create_openai_client(
+            api_key=api_key,
+            base_url=base_url,
+            _provider_id=provider_id,
+            **extra,
+        )
         _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
         return _client, model
 
@@ -4317,6 +4337,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         "base_url": str(sync_client.base_url),
     }
     sync_base_url = str(sync_client.base_url)
+    inferred_provider = None
+    try:
+        from agent.model_metadata import _infer_provider_from_url
+
+        inferred_provider = _infer_provider_from_url(sync_base_url)
+    except Exception:
+        pass
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = build_or_headers()
     elif base_url_host_matches(sync_base_url, "githubcopilot.com"):
@@ -4334,11 +4361,9 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         # client-level headers on their ProviderProfile (e.g. attribution
         # User-Agent strings). Provider is inferred from the hostname.
         try:
-            from agent.model_metadata import _infer_provider_from_url
             from providers import get_provider_profile as _gpf_async
-            _inferred = _infer_provider_from_url(sync_base_url)
-            if _inferred:
-                _ph_async = _gpf_async(_inferred)
+            if inferred_provider:
+                _ph_async = _gpf_async(inferred_provider)
                 if _ph_async and _ph_async.default_headers:
                     async_kwargs["default_headers"] = dict(_ph_async.default_headers)
         except Exception:
@@ -4347,7 +4372,11 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     if _merged_async:
         async_kwargs["default_headers"] = _merged_async
     async_kwargs = {
-        **_openai_http_client_kwargs(sync_base_url, async_mode=True),
+        **_openai_http_client_kwargs(
+            sync_base_url,
+            async_mode=True,
+            provider_id=inferred_provider,
+        ),
         **async_kwargs,
     }
     # See _create_openai_client: disable SDK-internal retries so Hermes owns
@@ -4927,8 +4956,12 @@ def resolve_provider_client(
         _merged_main = _apply_user_default_headers(headers)
         if _merged_main:
             headers = _merged_main
-        client = _create_openai_client(api_key=api_key, base_url=base_url,
-                        **({"default_headers": headers} if headers else {}))
+        client = _create_openai_client(
+            api_key=api_key,
+            base_url=base_url,
+            _provider_id=provider,
+            **({"default_headers": headers} if headers else {}),
+        )
 
         # Copilot GPT-5+ models (except gpt-5-mini) require the Responses
         # API — they are not accessible via /chat/completions.  Wrap the

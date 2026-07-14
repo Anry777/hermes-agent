@@ -675,6 +675,7 @@ class SessionEntry:
     was_auto_reset: bool = False
     auto_reset_reason: Optional[str] = None  # "idle" or "daily"
     reset_had_activity: bool = False  # whether the expired session had any messages
+    parent_session_id: Optional[str] = None  # expired session continued by this auto-reset child
 
     # Set by reset_session() when the user explicitly sends /new or /reset.
     # Consumed once by _handle_message_with_agent to trigger topic/channel
@@ -747,6 +748,7 @@ class SessionEntry:
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
+            "parent_session_id": self.parent_session_id,
         }
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
@@ -822,6 +824,7 @@ class SessionEntry:
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
+            parent_session_id=data.get("parent_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
 
@@ -1841,6 +1844,11 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                parent_session_id=(
+                    db_end_session_id
+                    if was_auto_reset and auto_reset_reason in {"idle", "daily"}
+                    else None
+                ),
             )
 
             self._entries[session_key] = entry
@@ -1854,6 +1862,8 @@ class SessionStore:
                 "chat_type": source.chat_type,
                 "thread_id": source.thread_id,
             }
+            if was_auto_reset and auto_reset_reason in {"idle", "daily"} and db_end_session_id:
+                db_create_kwargs["parent_session_id"] = db_end_session_id
 
         # SQLite operations outside the lock
         if self._db and db_end_session_id:
@@ -2326,16 +2336,69 @@ class SessionStore:
             logger.debug("Failed to rewrite transcript in DB: %s", e)
             return False
 
-    def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
+    def _reset_parent_session_ids(self, session_id: str) -> List[str]:
+        """Return reset-continuity session ids from oldest parent to *session_id*.
+
+        Only follows parent links created by gateway auto-reset. Compression
+        parentage is intentionally not expanded: compressed child sessions
+        already contain the summary that should be replayed, and loading their
+        full ancestors would reintroduce the oversized transcript that
+        compression split away.
+        """
+        if not self._db or not session_id:
+            return [session_id]
+
+        chain = [session_id]
+        current = session_id
+        seen = {session_id}
+        for _ in range(100):
+            try:
+                current_row = self._db.get_session(current)
+            except Exception as e:
+                logger.debug("Could not inspect session reset parent for %s: %s", current, e)
+                break
+            if not current_row:
+                break
+            parent_id = current_row.get("parent_session_id")
+            if not parent_id or parent_id in seen:
+                break
+            try:
+                parent_row = self._db.get_session(parent_id)
+            except Exception as e:
+                logger.debug("Could not inspect parent session %s: %s", parent_id, e)
+                break
+            if not parent_row or parent_row.get("end_reason") != "session_reset":
+                break
+            chain.append(parent_id)
+            seen.add(parent_id)
+            current = parent_id
+        return list(reversed(chain))
+
+    def load_transcript(
+        self,
+        session_id: str,
+        *,
+        include_reset_parents: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript.
 
         state.db is the canonical store. The legacy JSONL fallback was removed
         in spec 002 — pre-DB sessions on existing disks have already been
         migrated (their DB row holds the full message history).
+
+        When ``include_reset_parents`` is true, prepend transcripts from
+        gateway auto-reset parents (``end_reason='session_reset'``) so a
+        daily/idle reset remains conversationally continuous. Non-reset
+        parent links, especially compression splits, are not expanded.
         """
         if not self._db:
             return []
         try:
+            if include_reset_parents:
+                messages: List[Dict[str, Any]] = []
+                for sid in self._reset_parent_session_ids(session_id):
+                    messages.extend(self._db.get_messages_as_conversation(sid))
+                return messages
             return self._db.get_messages_as_conversation(session_id)
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)

@@ -475,6 +475,156 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
 
 
 @pytest.mark.asyncio
+async def test_first_run_platform_can_suppress_home_channel_onboarding(monkeypatch):
+    import gateway.run as gateway_run
+
+    platform = Platform("telegram_userbot")
+    source = _make_source(platform)
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=platform,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=platform)
+    runner.adapters[platform].suppress_home_channel_onboarding = True
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = False
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model": "openai/test-model",
+        }
+    )
+
+    monkeypatch.delenv("TELEGRAM_USERBOT_HOME_CHANNEL", raising=False)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("hello", platform=platform))
+
+    assert result == "ok"
+    runner.adapters[platform].send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_can_silently_ignore_known_gateway_commands():
+    platform = Platform("telegram_userbot")
+    source = _make_source(platform)
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=platform,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=platform)
+    runner.adapters[platform].suppress_system_messages = True
+    runner._maybe_confirm_destructive_slash = AsyncMock(return_value="confirm reset")
+
+    result = await runner._handle_message(_make_event("/reset", platform=platform))
+
+    assert result is None
+    runner._maybe_confirm_destructive_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_can_suppress_internal_agent_error_messages(monkeypatch):
+    import gateway.run as gateway_run
+
+    platform = Platform("telegram_userbot")
+    source = _make_source(platform)
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=platform,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=platform)
+    runner.adapters[platform].suppress_system_messages = True
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "earlier"}
+    ]
+    runner._run_agent = AsyncMock(side_effect=RuntimeError("internal failure"))
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("hello", platform=platform))
+
+    assert result is None
+    runner._run_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_platform_system_message_suppression_preserves_normal_reply(monkeypatch):
+    import gateway.run as gateway_run
+
+    platform = Platform("telegram_userbot")
+    source = _make_source(platform)
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=platform,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=platform)
+    runner.adapters[platform].suppress_system_messages = True
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "earlier"}
+    ]
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ordinary reply",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model": "openai/test-model",
+        }
+    )
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("hello", platform=platform))
+
+    assert result == "ordinary reply"
+
+
+@pytest.mark.asyncio
 async def test_handle_message_discards_stale_result_after_session_invalidation(monkeypatch):
     import gateway.run as gateway_run
 

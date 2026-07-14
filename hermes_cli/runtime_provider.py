@@ -352,6 +352,38 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     return None
 
 
+def _provider_profile_model_api_mode(provider: str, model: Any) -> Optional[str]:
+    """Return a provider-profile per-model api_mode override, if declared."""
+    provider_name = (provider or "").strip().lower()
+    model_name = str(model or "").strip()
+    if not provider_name or not model_name:
+        return None
+    try:
+        import importlib
+
+        provider_module = importlib.import_module("providers")
+        profile = provider_module.get_provider_profile(provider_name)
+        if profile is None:
+            return None
+        get_mode = getattr(profile, "get_model_api_mode", None)
+        if callable(get_mode):
+            return _parse_api_mode(get_mode(model_name))
+        mode_map = getattr(profile, "model_api_modes", None) or {}
+        if isinstance(mode_map, dict):
+            bare = model_name.lower().rsplit("/", 1)[-1]
+            if ":" in bare and not bare.startswith("http"):
+                bare = bare.split(":", 1)[1]
+            for key, value in mode_map.items():
+                key_norm = str(key).strip().lower().rsplit("/", 1)[-1]
+                if ":" in key_norm and not key_norm.startswith("http"):
+                    key_norm = key_norm.split(":", 1)[1]
+                if key_norm == bare:
+                    return _parse_api_mode(value)
+    except Exception:
+        return None
+    return None
+
+
 def _nous_inference_base_url_override() -> str:
     """Return the trusted Nous runtime base URL override, if configured.
 
@@ -484,6 +516,7 @@ def _resolve_runtime_from_pool_entry(
             if cfg_base_url:
                 base_url = cfg_base_url
         configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+        profile_mode = _provider_profile_model_api_mode(provider, effective_model)
         if provider in {"opencode-zen", "opencode-go"}:
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
@@ -492,6 +525,8 @@ def _resolve_runtime_from_pool_entry(
             # Refs #16878.
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, effective_model)
+        elif profile_mode:
+            api_mode = profile_mode
         elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
             api_mode = configured_mode
         else:
@@ -1358,6 +1393,7 @@ def _resolve_explicit_runtime(
     model_cfg: Dict[str, Any],
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
@@ -1479,10 +1515,14 @@ def _resolve_explicit_runtime(
                 base_url = creds.get("base_url", "").rstrip("/")
 
         api_mode = "chat_completions"
+        effective_model = target_model or model_cfg.get("default", "")
+        profile_mode = _provider_profile_model_api_mode(provider, effective_model)
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif profile_mode:
+            api_mode = profile_mode
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if configured_mode:
@@ -1661,6 +1701,7 @@ def resolve_runtime_provider(
         model_cfg=model_cfg,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     if explicit_runtime:
         return explicit_runtime
@@ -2007,6 +2048,10 @@ def resolve_runtime_provider(
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+            profile_mode = _provider_profile_model_api_mode(
+                provider,
+                target_model or model_cfg.get("default", ""),
+            )
             if provider in {"opencode-zen", "opencode-go"}:
                 # opencode-zen/go must always re-derive api_mode from the
                 # target model (not the stale persisted api_mode), because
@@ -2019,6 +2064,8 @@ def resolve_runtime_provider(
                 from hermes_cli.models import opencode_model_api_mode
                 _effective = target_model or model_cfg.get("default", "")
                 api_mode = opencode_model_api_mode(provider, _effective)
+            elif profile_mode:
+                api_mode = profile_mode
             elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
             else:

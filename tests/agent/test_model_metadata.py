@@ -302,6 +302,75 @@ class TestDefaultContextLengths:
 
 
 # =========================================================================
+# Provider plugin context-window resolution
+# =========================================================================
+
+class TestProviderPluginContextLength:
+    def _register_context_plugin(self):
+        from providers import register_provider
+        from providers.base import ProviderProfile
+
+        register_provider(ProviderProfile(
+            name="plugin-ctx-test",
+            display_name="Plugin Context Test",
+            base_url="https://ctx-plugin.example/v1",
+            hostname="ctx-plugin.example",
+            fallback_models=("gpt-5.5",),
+            model_context_lengths={"gpt-5.5": 272_000},
+        ))
+
+    def test_provider_plugin_context_window_wins_by_provider_id(self):
+        self._register_context_plugin()
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}):
+            assert get_model_context_length(
+                model="gpt-5.5",
+                base_url="https://ctx-plugin.example/v1",
+                api_key="",
+                provider="plugin-ctx-test",
+            ) == 272_000
+
+    def test_provider_plugin_context_window_can_resolve_from_base_url(self):
+        self._register_context_plugin()
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}):
+            assert get_model_context_length(
+                model="gpt-5.5",
+                base_url="https://ctx-plugin.example/v1",
+                api_key="",
+                provider="",
+            ) == 272_000
+
+    def test_vibemode_context_window_can_resolve_from_provider_id(self):
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}):
+            assert get_model_context_length(
+                model="gpt-5.5",
+                base_url="https://api.vibemod.pro/v1",
+                api_key="",
+                provider="vibemode",
+            ) == 272_000
+
+    def test_vibemode_context_window_can_resolve_from_base_url(self):
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}):
+            assert get_model_context_length(
+                model="deepseek-v4-pro",
+                base_url="https://api.vibemod.pro/v1",
+                api_key="",
+                provider="",
+            ) == 1_000_000
+
+
+# =========================================================================
 # Codex OAuth context-window resolution (provider="openai-codex")
 # =========================================================================
 

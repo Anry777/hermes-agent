@@ -149,6 +149,11 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "wecom":           _TIER_LOW,
     "wecom_callback":  _TIER_LOW,
     "dingtalk":        _TIER_LOW,
+    # MAX has no edit support in the current adapter, but home/local bots need
+    # visible in-chat activity because native typing is easy to miss in the
+    # MAX client.  Use "new" so only tool changes are announced, and keep
+    # streaming off until message editing/update support exists.
+    "max":             {**_TIER_LOW, "tool_progress": "new", "tool_preview_length": 80},
 
     # Tier 4 — batch or non-interactive delivery
     "email":           _TIER_MINIMAL,

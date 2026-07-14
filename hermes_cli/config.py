@@ -1770,13 +1770,11 @@ DEFAULT_CONFIG = {
         # spinner), or ascii.  Live-swappable via `/indicator <style>`.
         "tui_status_indicator": "kaomoji",
         # Seconds between prompt_toolkit redraws in the classic CLI when idle.
-        # Default 1.0 keeps the wall-clock status-bar read-outs (idle-since-
-        # last-turn) ticking and keeps the bottom chrome alive during idle —
-        # without it prompt_toolkit stops repainting the status bar after a
-        # turn and it can go stale/disappear (#45592).
-        # Set 0 to disable the background refresh if it fights terminal
-        # auto-scroll in non-fullscreen mode on some emulators (#48309).
-        "cli_refresh_interval": 1.0,
+        # PatchKit defaults this to 0 so idle prompt_toolkit redraws do not
+        # yank terminal scrollback to the bottom in non-fullscreen mode
+        # (#48309). Set a positive value such as 1.0 to opt back into the
+        # upstream idle clock/status-bar refresh behavior (#45592).
+        "cli_refresh_interval": 0,
         "user_message_preview": {  # CLI: how many submitted user-message lines to echo back in scrollback
             "first_lines": 2,
             "last_lines": 2,
@@ -2836,23 +2834,35 @@ DEFAULT_CONFIG = {
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
 
-        # When false (default), any file path the agent emits is delivered
-        # as a native attachment as long as it isn't under the credential /
-        # system-path denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
-        # auth.json, etc.). This matches the symmetry of inbound delivery
-        # — we accept any document type the user uploads, and the agent
-        # can hand back any file that isn't a credential.
+        # Safe default: ordinary absolute paths in assistant text remain text.
+        # Only explicit MEDIA:/path directives or structured artifact fields
+        # become native attachment candidates. Set this true to restore the
+        # legacy behavior where bare local paths such as /tmp/report.xlsx are
+        # extracted from response text and uploaded after validation.
+        "auto_upload_local_paths": False,
+        # Path validation mode for native attachment candidates. This is a
+        # separate safety layer from auto_upload_local_paths: MEDIA:/path is
+        # always a candidate, and legacy bare-path candidates only exist when
+        # auto_upload_local_paths is true. All candidates still pass through
+        # validate_media_delivery_path().
         #
-        # When true, fall back to the older allowlist+recency-window
-        # behavior: files must live under the Hermes cache, under
+        # When false (default), an attachment candidate is delivered as long as
+        # it is an existing regular file outside the credential / system-path
+        # denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env, auth.json,
+        # etc.). This matches the private/single-user symmetry of inbound
+        # delivery while keeping obvious secrets blocked.
+        #
+        # When true, fall back to the older allowlist+recency-window behavior:
+        # files must live under the Hermes cache, under
         # ``media_delivery_allow_dirs``, or be freshly produced inside the
-        # ``trust_recent_files_seconds`` window. Recommended for
-        # public-facing gateways where prompt injection from one user
-        # shouldn't be able to exfiltrate the host's secrets to that same
-        # user. Bridged to HERMES_MEDIA_DELIVERY_STRICT.
+        # ``trust_recent_files_seconds`` window. Recommended for public-facing
+        # gateways where prompt injection from one user shouldn't be able to
+        # exfiltrate the host's secrets to that same user. Bridged to
+        # HERMES_MEDIA_DELIVERY_STRICT.
         "strict": False,
-        # Extra directories from which model-emitted bare file paths may be
-        # uploaded as native gateway attachments. Files inside the Hermes
+        # Extra directories from which local files may be uploaded as native
+        # gateway attachments after becoming explicit attachment candidates.
+        # Files inside the Hermes
         # cache (~/.hermes/cache/{documents,images,audio,video,screenshots})
         # are always trusted; this list adds operator-controlled roots
         # (project dirs, scratch dirs, mounted shares). Accepts a list of

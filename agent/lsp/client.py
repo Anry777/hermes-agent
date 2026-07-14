@@ -1,8 +1,8 @@
-"""Async LSP client over stdin/stdout.
+"""Async LSP client over a configurable transport.
 
 One :class:`LSPClient` corresponds to one ``(language_server, workspace_root)``
 pair — exactly what OpenCode keys clients on, and the same shape Claude
-Code uses.  The client owns a child process, drives the JSON-RPC
+Code uses.  The client owns a JSON-RPC transport, drives the protocol
 exchange, and exposes:
 
 - :meth:`open_file` / :meth:`change_file` — text document sync
@@ -55,13 +55,12 @@ from agent.lsp.protocol import (
     LSPProtocolError,
     LSPRequestError,
     classify_message,
-    encode_message,
     make_error_response,
     make_notification,
     make_request,
     make_response,
-    read_message,
 )
+from agent.lsp.transports import LSPTransport, StdioLSPTransport
 
 logger = logging.getLogger("agent.lsp.client")
 
@@ -146,23 +145,28 @@ class LSPClient:
         *,
         server_id: str,
         workspace_root: str,
-        command: List[str],
+        command: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
         initialization_options: Optional[Dict[str, Any]] = None,
         seed_diagnostics_on_first_push: bool = False,
+        transport: Optional[LSPTransport] = None,
     ) -> None:
         self.server_id = server_id
         self.workspace_root = workspace_root
-        self._command = list(command)
+        self._command = list(command or [])
         self._env = env
         self._cwd = cwd or workspace_root
         self._init_options = initialization_options or {}
         self._seed_first_push = seed_diagnostics_on_first_push
 
-        # Process + streams
-        self._proc: Optional[asyncio.subprocess.Process] = None
-        self._stderr_task: Optional[asyncio.Task] = None
+        # Transport + reader loop
+        self._transport: LSPTransport = transport or StdioLSPTransport(
+            server_id,
+            self._command,
+            env=env,
+            cwd=self._cwd,
+        )
         self._reader_task: Optional[asyncio.Task] = None
 
         # Request/response correlation
@@ -220,7 +224,11 @@ class LSPClient:
 
     @property
     def is_running(self) -> bool:
-        return self._state == "running" and self._proc is not None and self._proc.returncode is None
+        return self._state == "running" and self._transport.is_running
+
+    @property
+    def initialize_result(self) -> Optional[Dict[str, Any]]:
+        return self._initialize_result
 
     @property
     def state(self) -> str:
@@ -242,7 +250,7 @@ class LSPClient:
             self._state = "running"
         except Exception:
             self._state = "error"
-            await self._cleanup_process()
+            await self._cleanup_transport()
             raise
 
     @staticmethod
@@ -254,63 +262,15 @@ class LSPClient:
         return cmd
 
     async def _spawn(self) -> None:
-        env = dict(os.environ)
-        if self._env:
-            env.update(self._env)
 
-        cmd = self._command
-        if sys.platform == "win32":
-            cmd = self._win_wrap_cmd(cmd)
+        await self._transport.start()
 
-        try:
-            # start_new_session=True detaches the LSP server into its own
-            # process group / session. Without this, the LSP server inherits
-            # the gateway's pgid (= TUI parent PID). When mcp_tool's
-            # _kill_orphaned_mcp_children races with LSP spawn and sweeps the
-            # gateway's child set, it captures the LSP PID, records the
-            # inherited pgid, and killpg() then kills the TUI parent itself.
-            # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
-            self._proc = await asyncio.create_subprocess_exec(
-                cmd[0],
-                *cmd[1:],
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=self._cwd,
-                start_new_session=True,
-            )
-        except FileNotFoundError as e:
-            raise LSPProtocolError(
-                f"LSP server binary not found: {cmd[0]} ({e})"
-            ) from e
-
-        # Drain stderr at debug level — if we don't, the pipe buffer
-        # fills and the server hangs.
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-        # Start the reader loop.
         self._reader_task = asyncio.create_task(self._reader_loop())
 
-    async def _drain_stderr(self) -> None:
-        if self._proc is None or self._proc.stderr is None:
-            return
-        try:
-            while True:
-                line = await self._proc.stderr.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    logger.debug("[%s] stderr: %s", self.server_id, text[:1000])
-        except (asyncio.CancelledError, OSError):
-            pass
-
     async def _reader_loop(self) -> None:
-        if self._proc is None or self._proc.stdout is None:
-            return
         try:
             while True:
-                msg = await read_message(self._proc.stdout)
+                msg = await self._transport.recv()
                 if msg is None:
                     logger.debug("[%s] server closed stdout cleanly", self.server_id)
                     break
@@ -429,57 +389,34 @@ class LSPClient:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._cleanup_transport()
 
-    async def _cleanup_process(self) -> None:
+    async def _cleanup_transport(self) -> None:
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:
                 await self._reader_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        if self._stderr_task is not None and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        if proc.returncode is None:
-            try:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
-            except ProcessLookupError:
-                pass
+        await self._transport.close()
 
     # ------------------------------------------------------------------
     # request / notification plumbing
     # ------------------------------------------------------------------
 
     async def _send_request(self, method: str, params: Any) -> Any:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            raise LSPProtocolError(f"cannot send {method!r}: stdin closed")
         loop = asyncio.get_running_loop()
         req_id = self._next_id
         self._next_id += 1
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         try:
-            self._proc.stdin.write(encode_message(make_request(req_id, method, params)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            await self._transport.send(make_request(req_id, method, params))
+        except Exception as e:  # noqa: BLE001
             self._pending.pop(req_id, None)
-            raise LSPProtocolError(f"send failed for {method!r}: {e}") from e
+            if isinstance(e, LSPProtocolError):
+                raise LSPProtocolError(f"send failed for {method!r}: {e}") from e
+            raise LSPProtocolError(f"send failed for {method!r}: {type(e).__name__}: {e}") from e
         try:
             return await fut
         finally:
@@ -502,30 +439,21 @@ class LSPClient:
                 raise
 
     async def _send_notification(self, method: str, params: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
         try:
-            self._proc.stdin.write(encode_message(make_notification(method, params)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            await self._transport.send(make_notification(method, params))
+        except Exception as e:  # noqa: BLE001
             logger.debug("[%s] notify %s failed: %s", self.server_id, method, e)
 
     async def _send_response(self, req_id: Any, result: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
         try:
-            self._proc.stdin.write(encode_message(make_response(req_id, result)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+            await self._transport.send(make_response(req_id, result))
+        except Exception:  # noqa: BLE001
             pass
 
     async def _send_error_response(self, req_id: Any, code: int, message: str) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
         try:
-            self._proc.stdin.write(encode_message(make_error_response(req_id, code, message)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+            await self._transport.send(make_error_response(req_id, code, message))
+        except Exception:  # noqa: BLE001
             pass
 
     def _dispatch_response(self, req_id: int, msg: dict) -> None:

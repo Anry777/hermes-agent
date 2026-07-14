@@ -96,6 +96,38 @@ async def test_edit_overflow_split_reports_partial_failure_when_continuation_fai
 
 
 @pytest.mark.asyncio
+async def test_edit_overflow_split_reports_partial_when_final_first_chunk_edit_is_flood_limited(telegram_adapter):
+    """A flood-limited final overflow edit must not trigger a full resend.
+
+    Mid-stream Telegram previews show a truncated first chunk. If the final
+    overflow split cannot re-edit that first chunk because Telegram rate-limits
+    the cosmetic/finalize edit, the stream consumer still needs partial-overflow
+    metadata so it sends only the missing tail instead of a duplicate full reply.
+    """
+    content = "word " * 120
+    telegram_adapter._bot.edit_message_text = AsyncMock(
+        side_effect=RuntimeError("Flood control exceeded. Retry in 27 seconds")
+    )
+    telegram_adapter._bot.send_message = AsyncMock()
+
+    result = await telegram_adapter._edit_overflow_split(
+        "12345", "201", content, finalize=True, metadata={"thread_id": "77"}
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "overflow_first_chunk_flood_control"
+    assert result.message_id == "201"
+    assert result.raw_response["partial_overflow"] is True
+    assert result.raw_response["delivered_chunks"] == 1
+    assert result.raw_response["total_chunks"] > 1
+    assert result.raw_response["last_message_id"] == "201"
+    assert result.raw_response["delivered_prefix"]
+    assert result.continuation_message_ids == ()
+    telegram_adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stream_consumer_fallback_sends_tail_after_partial_overflow():
     """A partial overflow edit enters fallback instead of marking final delivered."""
     adapter = MagicMock()

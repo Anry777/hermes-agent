@@ -8,6 +8,8 @@ only looked at `providers:`.
 import hermes_cli.providers as providers_mod
 from hermes_cli.model_switch import list_authenticated_providers, switch_model
 from hermes_cli.providers import resolve_provider_full
+from providers import register_provider
+from providers.base import ProviderProfile
 
 
 _MOCK_VALIDATION = {
@@ -210,6 +212,37 @@ def test_switch_model_accepts_explicit_bare_custom_current_endpoint(monkeypatch)
     assert result.api_key == "sk-test"
 
 
+def test_resolve_provider_full_finds_provider_plugin_profile():
+    """Provider-module plugins should resolve without config.yaml providers entries."""
+    register_provider(
+        ProviderProfile(
+            name="plugin-switch-test",
+            display_name="Plugin Switch Test",
+            api_mode="codex_responses",
+            env_vars=("PLUGIN_SWITCH_TEST_API_KEY", "PLUGIN_SWITCH_TEST_BASE_URL"),
+            base_url="https://plugin-switch.example/v1",
+            auth_type="api_key",
+            fallback_models=("plugin-model-a", "plugin-model-b"),
+        )
+    )
+
+    resolved = resolve_provider_full(
+        "plugin-switch-test",
+        user_providers={},
+        custom_providers=[],
+    )
+
+    assert resolved is not None
+    assert resolved.id == "plugin-switch-test"
+    assert resolved.name == "Plugin Switch Test"
+    assert resolved.transport == "codex_responses"
+    assert resolved.api_key_env_vars == ("PLUGIN_SWITCH_TEST_API_KEY",)
+    assert resolved.base_url == "https://plugin-switch.example/v1"
+    assert resolved.base_url_env_var == "PLUGIN_SWITCH_TEST_BASE_URL"
+    assert resolved.auth_type == "api_key"
+    assert resolved.source == "provider-plugin"
+
+
 def test_is_aggregator_recognizes_named_custom_provider():
     assert providers_mod.is_aggregator("custom:hpc-ai") is True
     assert providers_mod.is_aggregator("custom:litellm") is True
@@ -273,6 +306,50 @@ def test_switch_model_accepts_explicit_named_custom_provider(monkeypatch):
     assert result.new_model == "rotator-openrouter-coding"
     assert result.base_url == "http://127.0.0.1:4141/v1"
     assert result.api_key == "no-key-required"
+
+
+def test_switch_model_accepts_explicit_provider_plugin(monkeypatch):
+    """The shared /model and /mode switch path should accept provider plugins."""
+    register_provider(
+        ProviderProfile(
+            name="plugin-switch-explicit",
+            display_name="Plugin Switch Explicit",
+            api_mode="chat_completions",
+            env_vars=("PLUGIN_SWITCH_EXPLICIT_API_KEY",),
+            base_url="https://plugin-explicit.example/v1",
+            auth_type="api_key",
+            fallback_models=("plugin-explicit-model",),
+        )
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "plugin-key",
+            "base_url": "https://plugin-explicit.example/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", lambda *a, **k: _MOCK_VALIDATION)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="plugin-explicit-model",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        current_base_url="https://chatgpt.com/backend-api/codex",
+        current_api_key="",
+        explicit_provider="plugin-switch-explicit",
+        user_providers={},
+        custom_providers=[],
+    )
+
+    assert result.success is True
+    assert result.target_provider == "plugin-switch-explicit"
+    assert result.provider_label == "Plugin Switch Explicit"
+    assert result.new_model == "plugin-explicit-model"
+    assert result.base_url == "https://plugin-explicit.example/v1"
+    assert result.api_key == "plugin-key"
 
 
 def test_list_groups_same_name_custom_providers_into_one_row(monkeypatch):

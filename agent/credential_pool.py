@@ -585,6 +585,7 @@ class CredentialPool:
             terminal_status = STATUS_DEAD
         else:
             terminal_status = STATUS_EXHAUSTED
+        reset_at = normalized_error.get("reset_at") if terminal_status == STATUS_EXHAUSTED else None
         updated = replace(
             entry,
             last_status=terminal_status,
@@ -592,7 +593,7 @@ class CredentialPool:
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
+            last_error_reset_at=reset_at,
         )
         self._replace_entry(entry, updated)
         self._persist()
@@ -1378,6 +1379,16 @@ class CredentialPool:
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         for entry in self._entries:
+            if (
+                entry.last_status not in (STATUS_EXHAUSTED, STATUS_DEAD)
+                and entry.last_error_reset_at is not None
+            ):
+                # ponytail: legacy cleanup only; if more stale fields appear,
+                # move to a small normalization helper.
+                cleared = replace(entry, last_error_reset_at=None)
+                self._replace_entry(entry, cleared)
+                entry = cleared
+                cleared_any = True
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
             # by other processes (Claude Code CLI, other Hermes profiles).

@@ -1,0 +1,4 @@
+name: vibemode-provider
+kind: model-provider
+version: 1.0.0
+description: VibeMode multi-model provider for Chat, Responses, and Messages endpoints

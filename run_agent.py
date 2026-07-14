@@ -4366,6 +4366,7 @@ class AIAgent:
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                default_headers=self._provider_profile_default_headers(),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -4379,6 +4380,19 @@ class AIAgent:
         from agent.anthropic_adapter import _is_oauth_token
         self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
         return True
+
+    def _provider_profile_default_headers(self) -> Optional[Dict[str, str]]:
+        """Return client headers declared by the active provider profile."""
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(self.provider)
+            headers = getattr(profile, "default_headers", None) if profile else None
+            if headers:
+                return dict(headers)
+        except Exception:
+            pass
+        return None
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         from agent.auxiliary_client import (
@@ -4488,6 +4502,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                default_headers=self._provider_profile_default_headers(),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -4557,6 +4572,7 @@ class AIAgent:
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                default_headers=self._provider_profile_default_headers(),
                 drop_context_1m_beta=_drop_1m,
             )
 

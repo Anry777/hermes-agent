@@ -22,10 +22,35 @@ class TestRegistry:
     def test_unknown_provider_returns_none(self):
         assert get_provider_profile("nonexistent-provider") is None
 
+    def test_vibemode_has_no_extra_aliases(self):
+        p = get_provider_profile("vibemode")
+        assert p is not None
+        assert p.aliases == ()
+        assert get_provider_profile("vibemode-space") is None
+        assert get_provider_profile("vibemode-api") is None
+
     def test_all_providers_have_name(self):
         get_provider_profile("nvidia")  # trigger discovery
         for name, profile in _REGISTRY.items():
             assert profile.name == name
+
+
+class TestVibeModeProfile:
+    def test_dynamic_catalog_profile_with_known_model_metadata(self):
+        p = get_provider_profile("vibemode")
+        assert p is not None
+        assert p.api_mode == "chat_completions"
+        assert p.base_url == "https://api.vibemod.pro/v1"
+        assert p.env_vars == ("VIBEMODE_API_KEY", "VIBEMODE_BASE_URL")
+        assert p.default_headers == {"User-Agent": "HermesAgent/1.0"}
+        assert p.fallback_models == ()
+        assert p.get_model_context_length("gpt-5.5") == 272_000
+        assert p.get_model_context_length("deepseek-v4-flash") == 1_000_000
+        assert p.get_model_api_mode("gpt-5.5") == "codex_responses"
+        assert p.get_model_api_mode("deepseek-v4-pro") == "chat_completions"
+        assert p.get_model_api_mode("minimax-m3") == "anthropic_messages"
+        assert p.get_model_capabilities("qwen3.7-plus") == ("chat", "reasoning", "tools")
+        assert p.get_model_endpoint_kinds("gpt-5.4") == ("responses", "chat_completions")
 
 
 class TestNvidiaProfile:

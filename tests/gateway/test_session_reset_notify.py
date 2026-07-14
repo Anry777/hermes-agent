@@ -8,6 +8,7 @@ Verifies that:
 """
 
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 
 from gateway.config import (
@@ -16,6 +17,7 @@ from gateway.config import (
     SessionResetPolicy,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +164,81 @@ class TestSessionEntryReason:
         entry2 = store.get_or_create_session(source)
         assert entry2.was_auto_reset is True
         assert entry2.reset_had_activity is True
+
+    def test_auto_reset_records_parent_session_id_in_entry_and_db(self, tmp_path):
+        """Auto-reset children must point back to the expired session."""
+        config = GatewayConfig(
+            default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=1)
+        )
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+        source = _make_source()
+
+        entry1 = store.get_or_create_session(source)
+        entry1.last_prompt_tokens = 5000
+        entry1.updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+
+        entry2 = store.get_or_create_session(source)
+
+        assert entry2.was_auto_reset is True
+        assert entry2.parent_session_id == entry1.session_id
+        assert db.get_session(entry2.session_id)["parent_session_id"] == entry1.session_id
+        db.close()
+
+    def test_load_transcript_with_reset_parents_rehydrates_auto_reset_parent(self, tmp_path):
+        """Gateway turns after auto-reset should see the previous transcript."""
+        config = GatewayConfig(
+            default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=1)
+        )
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+        source = _make_source()
+
+        entry1 = store.get_or_create_session(source)
+        store.append_to_transcript(entry1.session_id, {"role": "user", "content": "remember old context"})
+        store.append_to_transcript(entry1.session_id, {"role": "assistant", "content": "old answer"})
+        entry1.last_prompt_tokens = 5000
+        entry1.updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+
+        entry2 = store.get_or_create_session(source)
+        store.append_to_transcript(entry2.session_id, {"role": "user", "content": "morning follow-up"})
+
+        plain = store.load_transcript(entry2.session_id)
+        restored = store.load_transcript(entry2.session_id, include_reset_parents=True)
+
+        assert [m["content"] for m in plain] == ["morning follow-up"]
+        assert [m["content"] for m in restored] == [
+            "remember old context",
+            "old answer",
+            "morning follow-up",
+        ]
+        db.close()
+
+    def test_load_transcript_with_reset_parents_ignores_compression_parent(self, tmp_path):
+        """Compression ancestry must not be expanded by the reset-continuity path."""
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+        db.create_session("parent", source="telegram")
+        db.append_message("parent", role="user", content="huge pre-compression transcript")
+        db.end_session("parent", "compression")
+        db.create_session("child", source="telegram", parent_session_id="parent")
+        db.append_message("child", role="user", content="compressed summary session")
+
+        restored = store.load_transcript("child", include_reset_parents=True)
+
+        assert [m["content"] for m in restored] == ["compressed summary session"]
+        db.close()
 
 
 # ---------------------------------------------------------------------------

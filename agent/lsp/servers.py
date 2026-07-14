@@ -25,7 +25,10 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from agent.lsp.workspace import nearest_root
+
+from agent.lsp.workspace import nearest_root, normalize_path
+from agent.lsp.transports import validate_websocket_url, websocket_dependency_available
+
 
 logger = logging.getLogger("agent.lsp.servers")
 
@@ -118,12 +121,14 @@ class SpawnSpec:
     marker not found, exclude marker hit, etc.).
     """
 
-    command: List[str]
-    workspace_root: str
-    cwd: str
+    command: List[str] = field(default_factory=list)
+    workspace_root: str = ""
+    cwd: str = ""
     env: Dict[str, str] = field(default_factory=dict)
     initialization_options: Dict[str, Any] = field(default_factory=dict)
     seed_diagnostics_on_first_push: bool = False
+    transport: str = "stdio"
+    url: Optional[str] = None
 
 
 @dataclass
@@ -146,6 +151,10 @@ class ServerDef:
     build_spawn: Callable[[str, "ServerContext"], Optional[SpawnSpec]]
     seed_first_push: bool = False
     description: str = ""
+    language_id: Optional[str] = None
+    transport_type: str = "stdio"
+    transport_target: Optional[str] = None
+    configured: bool = False
 
     def matches(self, file_path: str) -> bool:
         """Return True iff this server handles ``file_path``."""
@@ -968,6 +977,184 @@ def _root_powershell(file_path: str, workspace: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# config-driven custom server support
+# ---------------------------------------------------------------------------
+
+
+def _normalize_extension(ext: Any) -> Optional[str]:
+    if not isinstance(ext, str):
+        return None
+    value = ext.strip()
+    if not value:
+        return None
+    if value.startswith("."):
+        return value.lower()
+    # Preserve extensionless basename matches like Dockerfile when users
+    # intentionally pass a mixed-case name; normal language extensions get a dot.
+    if value.lower() == value and value.isalnum():
+        return "." + value.lower()
+    return value
+
+
+def _normalize_extensions(value: Any) -> Tuple[str, ...]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return ()
+    out: List[str] = []
+    for item in value:
+        ext = _normalize_extension(item)
+        if ext and ext not in out:
+            out.append(ext)
+    return tuple(out)
+
+
+def _transport_parts(sub: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    raw = sub.get("transport")
+    if isinstance(raw, dict):
+        transport_type = str(raw.get("type") or "stdio").strip().lower()
+        url = raw.get("url") or sub.get("url")
+    elif isinstance(raw, str):
+        transport_type = raw.strip().lower()
+        url = sub.get("url")
+    else:
+        transport_type = "stdio" if sub.get("command") else ""
+        url = sub.get("url")
+    return transport_type, str(url) if url is not None else None
+
+
+def _root_resolver_from_config(mode: Any) -> Callable[[str, str], Optional[str]]:
+    # First cut: config-defined servers default to the git workspace root.
+    # That matches current LSPService gating and avoids profile/path hardcoding.
+    # More modes can be added later without touching language-specific registry code.
+    return lambda fp, ws: ws
+
+
+def _configured_server_from_entry(name: str, sub: Any) -> Optional[ServerDef]:
+    if not isinstance(sub, dict):
+        return None
+    extensions = _normalize_extensions(sub.get("extensions"))
+    language_id = sub.get("language_id")
+    if not isinstance(language_id, str) or not language_id.strip() or not extensions:
+        return None
+
+    server_id = str(sub.get("server_id") or name).strip()
+    if not server_id:
+        return None
+    language_id = language_id.strip()
+    transport_type, url = _transport_parts(sub)
+    command = sub.get("command")
+    command_list = [str(x) for x in command] if isinstance(command, list) and command else []
+    env_cfg = sub.get("env")
+    env = {str(k): str(v) for k, v in env_cfg.items()} if isinstance(env_cfg, dict) else {}
+    init = sub.get("initialization_options")
+    init_options = init if isinstance(init, dict) else {}
+    root_resolver = _root_resolver_from_config(sub.get("workspace_root"))
+    seed_first_push = bool(sub.get("seed_diagnostics_on_first_push", False))
+    description = str(sub.get("description") or f"Configured LSP server — {server_id}")
+
+    def _spawn(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+        if transport_type == "websocket":
+            if not url:
+                return None
+            if validate_websocket_url(url):
+                return None
+            if not websocket_dependency_available():
+                return None
+            return SpawnSpec(
+                command=[],
+                workspace_root=root,
+                cwd=root,
+                env=env,
+                initialization_options=init_options,
+                seed_diagnostics_on_first_push=seed_first_push,
+                transport="websocket",
+                url=url,
+            )
+        if transport_type in ("stdio", ""):
+            cmd = command_list or ctx.binary_overrides.get(server_id, [])
+            if not cmd:
+                return None
+            merged_env = dict(env)
+            merged_env.update(ctx.env_overrides.get(server_id, {}))
+            merged_init = dict(init_options)
+            merged_init.update(ctx.init_overrides.get(server_id, {}))
+            return SpawnSpec(
+                command=cmd,
+                workspace_root=root,
+                cwd=root,
+                env=merged_env,
+                initialization_options=merged_init,
+                seed_diagnostics_on_first_push=seed_first_push,
+                transport="stdio",
+            )
+        return None
+
+    return ServerDef(
+        server_id=server_id,
+        extensions=extensions,
+        resolve_root=root_resolver,
+        build_spawn=_spawn,
+        seed_first_push=seed_first_push,
+        description=description,
+        language_id=language_id,
+        transport_type=transport_type or "stdio",
+        transport_target=url if transport_type == "websocket" else (" ".join(command_list) if command_list else None),
+        configured=True,
+    )
+
+
+def _iter_configured_server_entries(lsp_cfg: Any):
+    if not isinstance(lsp_cfg, dict):
+        return
+    servers_cfg = lsp_cfg.get("servers") or {}
+    if isinstance(servers_cfg, dict):
+        for name, sub in servers_cfg.items():
+            # Existing built-in overrides often only contain command/env/init.
+            # Treat entries as new server definitions only when they declare
+            # extensions + language_id, i.e. enough data to route files by config.
+            if isinstance(sub, dict) and (sub.get("extensions") is not None or sub.get("language_id") is not None):
+                yield str(name), sub
+    custom_cfg = lsp_cfg.get("custom_servers") or {}
+    if isinstance(custom_cfg, dict):
+        for name, sub in custom_cfg.items():
+            yield str(name), sub
+
+
+def build_servers_from_lsp_config(lsp_cfg: Any) -> Tuple[List[ServerDef], Dict[str, str]]:
+    """Return built-in servers plus config-defined custom server definitions.
+
+    This is intentionally pure: it does not mutate the module-level ``SERVERS``
+    or ``LANGUAGE_BY_EXT``.  Each profile/session gets its own registry view.
+    """
+    servers = list(SERVERS)
+    language_by_ext = dict(LANGUAGE_BY_EXT)
+    for name, sub in _iter_configured_server_entries(lsp_cfg):
+        srv = _configured_server_from_entry(name, sub)
+        if srv is None:
+            continue
+        servers = [existing for existing in servers if existing.server_id != srv.server_id]
+        servers.append(srv)
+        for ext in srv.extensions:
+            language_by_ext[ext] = srv.language_id or language_by_ext.get(ext, "plaintext")
+    return servers, language_by_ext
+
+
+def server_availability(srv: ServerDef) -> Tuple[str, str]:
+    """Return (availability, reason) for CLI/status display."""
+    if srv.transport_type == "websocket":
+        if not srv.transport_target:
+            return "unavailable", "missing websocket url"
+        url_error = validate_websocket_url(srv.transport_target)
+        if url_error:
+            return "unavailable", url_error
+        if not websocket_dependency_available():
+            return "unavailable", "websockets package is not installed"
+        return "configured", "websocket target configured"
+    return "configured" if srv.configured else "builtin", "stdio server"
+
+
 SERVERS: List[ServerDef] = [
     ServerDef(
         server_id="pyright",
@@ -1162,18 +1349,20 @@ SERVERS: List[ServerDef] = [
 ]
 
 
-def find_server_for_file(file_path: str) -> Optional[ServerDef]:
+def find_server_for_file(file_path: str, *, servers: Optional[Sequence[ServerDef]] = None) -> Optional[ServerDef]:
     """Return the registry entry that handles ``file_path``, or None."""
-    for srv in SERVERS:
+    registry = servers if servers is not None else SERVERS
+    for srv in registry:
         if srv.matches(file_path):
             return srv
     return None
 
 
-def language_id_for(path: str) -> str:
+def language_id_for(path: str, *, language_by_ext: Optional[Dict[str, str]] = None) -> str:
     """Return the LSP languageId to send in didOpen for ``path``."""
     ext = _file_ext_or_basename(path)
-    return LANGUAGE_BY_EXT.get(ext, "plaintext")
+    mapping = language_by_ext if language_by_ext is not None else LANGUAGE_BY_EXT
+    return mapping.get(ext, "plaintext")
 
 
 __all__ = [
@@ -1183,5 +1372,7 @@ __all__ = [
     "SERVERS",
     "find_server_for_file",
     "language_id_for",
+    "build_servers_from_lsp_config",
+    "server_availability",
     "LANGUAGE_BY_EXT",
 ]

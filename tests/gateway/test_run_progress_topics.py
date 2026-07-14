@@ -15,6 +15,18 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import SessionSource
 
 
+class _PluginPlatform:
+    """Minimal platform-like object for plugin-defined platform keys in tests."""
+
+    value = "max"
+
+    def __repr__(self):
+        return "PluginPlatform(max)"
+
+
+MAX_PLUGIN_PLATFORM = _PluginPlatform()
+
+
 class ProgressCaptureAdapter(BasePlatformAdapter):
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
@@ -221,6 +233,25 @@ class ManyProgressLinesAgent:
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MaxBurstProgressAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        if cb is not None:
+            cb("tool.started", "terminal", "date '+%Y-%m-%d %H:%M:%S %Z'", {})
+            time.sleep(0.25)
+            cb("tool.started", "web_extract", "https://example.com/rates", {})
+            time.sleep(1.1)
         return {
             "final_response": "done",
             "messages": [],
@@ -826,6 +857,30 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_max_progress_coalesces_first_burst_without_raw_previews(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MaxBurstProgressAgent,
+        session_id="sess-max-compact-progress",
+        config_data={"display": {"tool_progress": "all"}},
+        platform=MAX_PLUGIN_PLATFORM,
+        chat_id="777",
+        chat_type="group",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    content = adapter.sent[0]["content"]
+    assert "terminal..." in content
+    assert "web_extract..." in content
+    assert "date" not in content
+    assert "https://example.com/rates" not in content
+    assert '"' not in content
 
 
 @pytest.mark.asyncio

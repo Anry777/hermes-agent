@@ -873,6 +873,20 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
             extra.get("model_routes"),
         )
+        env_mode = os.getenv("API_SERVER_MODE", "").strip().lower()
+        if env_mode and "mode" not in extra:
+            extra = {**extra, "mode": env_mode}
+        self._mode: str = str(extra.get("mode") or "agent").strip().lower() or "agent"
+        self._provider_proxy = None
+        try:
+            from gateway.api_server_provider_proxy import APIServerProviderProxy
+            self._provider_proxy = APIServerProviderProxy.from_extra(extra)
+            if self._provider_proxy is not None:
+                self._mode = getattr(self._provider_proxy, "mode", "provider_proxy")
+        except Exception as exc:
+            if self._mode in {"provider_proxy", "codex_responses_proxy"}:
+                raise
+            logger.debug("Provider proxy mode unavailable: %s", exc)
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1401,6 +1415,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "status": "ok",
             "platform": "hermes-agent",
             "version": _hermes_version(),
+            "mode": self._mode,
             "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}),
             "active_agents": gw_active,
@@ -1419,10 +1434,12 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — list hermes-agent and any configured model_routes aliases."""
+        """GET /v1/models — list agent or provider-proxy models."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return await self._provider_proxy.handle_models(request)
 
         now = int(time.time())
         models = [
@@ -2063,6 +2080,8 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return await self._provider_proxy.handle_chat_completions(request)
 
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
@@ -3199,6 +3218,8 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return await self._provider_proxy.handle_responses(request)
 
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
@@ -4170,6 +4191,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._provider_proxy is not None:
+            return web.json_response(
+                _openai_error(
+                    "Agent runs are not supported in provider_proxy mode",
+                    code="unsupported_operation",
+                ),
+                status=400,
+            )
 
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)

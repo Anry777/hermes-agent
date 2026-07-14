@@ -77,12 +77,29 @@ class ProviderProfile:
     # Only agentic models that support tool calling should appear here.
     fallback_models: tuple = ()
 
+    # model_context_lengths: provider-enforced context windows for specific
+    # model ids. Used when the same bare model slug has different limits on
+    # this provider than on the direct upstream API or other providers.
+    model_context_lengths: dict[str, int] = field(default_factory=dict)
+
+    # Optional per-model metadata overlays.  These are deliberately not model
+    # catalogs: live /models discovery remains authoritative for availability.
+    # They describe how to call known slugs when a provider serves multiple API
+    # surfaces from one base URL.
+    model_api_modes: dict[str, str] = field(default_factory=dict)
+    model_capabilities: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    model_endpoint_kinds: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
     # hostname: base hostname for URL→provider reverse-mapping in model_metadata.py
     # e.g. "api.gmi-serving.com". Derived from base_url when empty.
     hostname: str = ""
 
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
+    # Header-name prefixes removed from fully materialized HTTP requests.
+    # OpenAI-compatible SDKs inject transport metadata after default_headers
+    # are merged, so WAF-sensitive providers need a final HTTPX-boundary hook.
+    request_header_prefixes_to_strip: tuple[str, ...] = ()
 
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
@@ -107,6 +124,68 @@ class ProviderProfile:
             from urllib.parse import urlparse
             return urlparse(self.base_url).hostname or ""
         return ""
+
+    @staticmethod
+    def _normalize_model_key(model: str | None) -> str:
+        """Normalize a model id for metadata map lookups.
+
+        Provider prefixes such as ``openrouter/foo`` or ``vibemode:foo`` are
+        display/routing hints, not part of the bare model slug stored in
+        provider-profile metadata.
+        """
+        value = (model or "").strip().lower()
+        if "/" in value:
+            value = value.rsplit("/", 1)[-1]
+        if ":" in value and not value.startswith("http"):
+            prefix, suffix = value.split(":", 1)
+            if prefix and suffix:
+                value = suffix
+        return value
+
+    def _lookup_model_map(self, mapping: dict[str, Any], model: str | None) -> Any:
+        key = self._normalize_model_key(model)
+        if not key or not isinstance(mapping, dict):
+            return None
+        if key in mapping:
+            return mapping[key]
+        for raw_key, value in mapping.items():
+            if self._normalize_model_key(str(raw_key)) == key:
+                return value
+        return None
+
+    def get_model_context_length(self, model: str | None) -> int | None:
+        """Return provider-specific context length for a known model slug."""
+        value = self._lookup_model_map(self.model_context_lengths, model)
+        return value if isinstance(value, int) and value > 0 else None
+
+    def get_model_api_mode(self, model: str | None) -> str | None:
+        """Return the preferred Hermes api_mode for a known model slug."""
+        value = self._lookup_model_map(self.model_api_modes, model)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {
+                "chat_completions",
+                "codex_responses",
+                "anthropic_messages",
+                "bedrock_converse",
+                "codex_app_server",
+            }:
+                return normalized
+        return None
+
+    def get_model_capabilities(self, model: str | None) -> tuple[str, ...]:
+        """Return known capability tags for a model, or an empty tuple."""
+        value = self._lookup_model_map(self.model_capabilities, model)
+        if isinstance(value, (tuple, list, set)):
+            return tuple(str(v) for v in value if str(v).strip())
+        return ()
+
+    def get_model_endpoint_kinds(self, model: str | None) -> tuple[str, ...]:
+        """Return known endpoint kinds for a model, or an empty tuple."""
+        value = self._lookup_model_map(self.model_endpoint_kinds, model)
+        if isinstance(value, (tuple, list, set)):
+            return tuple(str(v) for v in value if str(v).strip())
+        return ()
 
     def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Provider-specific message preprocessing.

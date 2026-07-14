@@ -1,0 +1,33 @@
+name: telegram-userbot-platform
+label: Telegram Userbot
+kind: platform
+version: 0.1.0
+description: >
+  Experimental Telegram MTProto gateway adapter for Hermes Agent. Uses
+  Telethon to connect through a Telegram user account and remains separate
+  from the official Telegram Bot API platform.
+author: Hermes PatchKit
+pip_dependencies:
+  - telethon>=1.40.0,<2
+requires_env:
+  - name: TELEGRAM_USERBOT_API_ID
+    description: "Telegram application API ID from my.telegram.org"
+    prompt: "Telegram API ID"
+    password: true
+  - name: TELEGRAM_USERBOT_API_HASH
+    description: "Telegram application API hash from my.telegram.org"
+    prompt: "Telegram API hash"
+    password: true
+optional_env:
+  - name: TELEGRAM_USERBOT_PHONE
+    description: "Phone number used only for first-time MTProto authorization"
+    prompt: "Telegram account phone number"
+    password: false
+  - name: TELEGRAM_USERBOT_2FA_PASSWORD
+    description: "Optional Telegram two-step verification password"
+    prompt: "Telegram 2FA password"
+    password: true
+  - name: TELEGRAM_USERBOT_SESSION_STRING
+    description: "Optional Telethon StringSession; prefer a profile-local session file"
+    prompt: "Telethon session string"
+    password: true

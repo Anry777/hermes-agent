@@ -49,7 +49,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
     "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek",
     "opencode-zen", "opencode-go", "kilocode", "alibaba", "novita",
-    "qwen-oauth",
+    "qwen-oauth", "vibemode",
     "xiaomi",
     "arcee",
     "gmi",
@@ -502,7 +502,79 @@ def _lmstudio_server_root(base_url: str) -> str:
 
 
 def _is_known_provider_base_url(base_url: str) -> bool:
-    return _infer_provider_from_url(base_url) is not None
+    if _infer_provider_from_url(base_url) is not None:
+        return True
+    try:
+        from providers import list_providers
+        return any(
+            (host := profile.get_hostname()) and base_url_host_matches(base_url, host)
+            for profile in list_providers()
+        )
+    except Exception:
+        return False
+
+
+def _lookup_profile_model_context(profile: Any, model: str) -> Optional[int]:
+    get_context = getattr(profile, "get_model_context_length", None)
+    if callable(get_context):
+        try:
+            value = get_context(model)
+            if isinstance(value, int) and value > 0:
+                return value
+        except Exception:
+            pass
+    context_map = getattr(profile, "model_context_lengths", None) or {}
+    if not isinstance(context_map, dict):
+        return None
+    model_bare = _strip_provider_prefix(model).strip()
+    model_lower = model_bare.lower()
+    model_normalized = _normalize_model_version(model_lower)
+    for key, value in context_map.items():
+        if not isinstance(key, str) or not isinstance(value, int) or value <= 0:
+            continue
+        key_bare = _strip_provider_prefix(key).strip().lower()
+        if key_bare == model_lower or _normalize_model_version(key_bare) == model_normalized:
+            return value
+    return None
+
+
+def _resolve_provider_plugin_context_length(provider: str, model: str, base_url: str = "") -> Optional[int]:
+    try:
+        from providers import get_provider_profile, list_providers
+    except Exception:
+        return None
+    checked: set[str] = set()
+
+    def _check(name: str) -> Optional[int]:
+        key = (name or "").strip().lower()
+        if not key or key in checked:
+            return None
+        checked.add(key)
+        profile = get_provider_profile(key)
+        if profile is None:
+            return None
+        return _lookup_profile_model_context(profile, model)
+
+    if provider:
+        ctx = _check(provider)
+        if ctx:
+            return ctx
+    if base_url:
+        inferred = _infer_provider_from_url(base_url)
+        if inferred:
+            ctx = _check(inferred)
+            if ctx:
+                return ctx
+        try:
+            for profile in list_providers():
+                host = profile.get_hostname()
+                if host and base_url_host_matches(base_url, host):
+                    ctx = _lookup_profile_model_context(profile, model)
+                    if ctx:
+                        return ctx
+        except Exception:
+            pass
+    return None
 
 
 def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
@@ -2182,6 +2254,15 @@ def get_model_context_length(
             if base_url:
                 save_context_length(model, base_url, codex_ctx)
             return codex_ctx
+
+    plugin_ctx = _resolve_provider_plugin_context_length(
+        effective_provider or provider,
+        model,
+        base_url=base_url or "",
+    )
+    if plugin_ctx:
+        return plugin_ctx
+
     if effective_provider == "gmi" and base_url:
         # GMI exposes authoritative context_length via /models, but it is not
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.

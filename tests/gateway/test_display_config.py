@@ -273,6 +273,14 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "whatsapp_cloud", "tool_progress") == "off"
         assert resolve_display_setting({}, "whatsapp_cloud", "streaming") is False
 
+    def test_max_defaults_to_visible_but_non_streaming_progress(self):
+        """MAX gets explicit in-chat progress by default, but no token streaming."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "max", "tool_progress") == "new"
+        assert resolve_display_setting({}, "max", "tool_preview_length") == 80
+        assert resolve_display_setting({}, "max", "streaming") is False
+
     def test_minimal_tier_platforms(self):
         """Email, SMS, webhook default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting

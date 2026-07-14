@@ -34,6 +34,9 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     sub_status.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
+    sub_status.add_argument(
+        "--check", action="store_true", help="Health-check configured websocket servers"
+    )
 
     sub_list = sub.add_parser("list", help="List supported language servers")
     sub_list.add_argument(
@@ -63,6 +66,9 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     sub_which = sub.add_parser("which", help="Print binary path for a server")
     sub_which.add_argument("server", help="Server id")
 
+    sub_test = sub.add_parser("test", help="Health-check a configured LSP server")
+    sub_test.add_argument("server", help="Server id")
+
     parser.set_defaults(func=run_lsp_command)
 
 
@@ -71,7 +77,7 @@ def run_lsp_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "lsp_command", None) or "status"
     try:
         if sub == "status":
-            return _cmd_status(getattr(args, "json", False))
+            return _cmd_status(getattr(args, "json", False), getattr(args, "check", False))
         if sub == "list":
             return _cmd_list(getattr(args, "installed_only", False))
         if sub == "install":
@@ -82,35 +88,59 @@ def run_lsp_command(args: argparse.Namespace) -> int:
             return _cmd_restart()
         if sub == "which":
             return _cmd_which(args.server)
+        if sub == "test":
+            return _cmd_test(args.server)
         sys.stderr.write(f"unknown lsp subcommand: {sub}\n")
         return 2
     except KeyboardInterrupt:
         return 130
 
 
-def _cmd_status(emit_json: bool) -> int:
+def _load_lsp_cfg() -> dict:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return {}
+    lsp_cfg = (cfg.get("lsp") or {}) if isinstance(cfg, dict) else {}
+    return lsp_cfg if isinstance(lsp_cfg, dict) else {}
+
+
+def _configured_registry():
+    from agent.lsp.servers import build_servers_from_lsp_config
+    return build_servers_from_lsp_config(_load_lsp_cfg())[0]
+
+
+def _cmd_status(emit_json: bool, check: bool = False) -> int:
     from agent.lsp import get_service
-    from agent.lsp.servers import SERVERS
     from agent.lsp.install import detect_status
+    from agent.lsp.servers import server_availability
 
     svc = get_service()
     service_active = svc is not None
-    info = svc.get_status() if svc is not None else {"enabled": False}
-
-    if emit_json:
-        import json
-        payload = {
-            "service": info,
-            "registry": [
+    info = svc.get_status() if svc is not None else {"enabled": False, "servers": []}
+    registry = info.get("servers") or []
+    if not registry:
+        registry = []
+        for s in _configured_registry():
+            availability, reason = server_availability(s)
+            registry.append(
                 {
                     "server_id": s.server_id,
                     "extensions": list(s.extensions),
                     "description": s.description,
-                    "binary_status": detect_status(_recipe_pkg_for(s.server_id)),
+                    "source": "configured" if s.configured else "builtin",
+                    "transport": s.transport_type,
+                    "target": s.transport_target,
+                    "availability": availability,
+                    "availability_reason": reason,
+                    "binary_status": detect_status(_recipe_pkg_for(s.server_id)) if s.transport_type != "websocket" else availability,
                 }
-                for s in SERVERS
-            ],
-        }
+            )
+
+    if emit_json:
+        import json
+        payload = {"service": info, "registry": registry}
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
 
@@ -153,37 +183,60 @@ def _cmd_status(emit_json: bool) -> int:
     out.append("")
     out.append("Registered Servers")
     out.append("==================")
-    for s in SERVERS:
-        pkg = _recipe_pkg_for(s.server_id)
-        status = detect_status(pkg)
+    for s in registry:
+        server_id = s["server_id"]
+        extensions = list(s.get("extensions") or [])
+        transport = s.get("transport") or "stdio"
+        status = s.get("availability") or s.get("binary_status") or "unknown"
+        if transport != "websocket" and "binary_status" not in s:
+            status = detect_status(_recipe_pkg_for(server_id))
         marker = {
             "installed": "✓",
+            "configured": "✓",
+            "builtin": "·",
             "missing": "·",
             "manual-only": "?",
+            "unavailable": "!",
         }.get(status, " ")
-        ext_summary = ", ".join(list(s.extensions)[:5])
-        if len(s.extensions) > 5:
-            ext_summary += f", … (+{len(s.extensions) - 5})"
+        ext_summary = ", ".join(extensions[:5])
+        if len(extensions) > 5:
+            ext_summary += f", … (+{len(extensions) - 5})"
+        source = s.get("source") or "builtin"
         out.append(
-            f"  {marker} {s.server_id:24s} [{status:11s}] {ext_summary}"
+            f"  {marker} {server_id:24s} [{status}] {ext_summary}"
         )
-        if s.description:
-            out.append(f"      {s.description}")
+        if transport != "stdio":
+            out.append(f"      {source}; {transport} {s.get('target') or ''}".rstrip())
+        if s.get("description"):
+            out.append(f"      {s['description']}")
+        if status == "unavailable" and s.get("availability_reason"):
+            out.append(f"      unavailable: {s['availability_reason']}")
+    if check:
+        out.append("")
+        out.append("Health checks")
+        out.append("=============")
+        for s in registry:
+            if s.get("transport") != "websocket":
+                continue
+            rc, lines = _healthcheck_server_dict(s)
+            prefix = "ok" if rc == 0 else "failed"
+            out.append(f"  {s['server_id']}: {prefix}")
+            out.extend(f"    {line}" for line in lines)
     sys.stdout.write("\n".join(out) + "\n")
     return 0
 
 
 def _cmd_list(installed_only: bool) -> int:
-    from agent.lsp.servers import SERVERS
     from agent.lsp.install import detect_status
+    from agent.lsp.servers import server_availability
 
-    for s in SERVERS:
-        pkg = _recipe_pkg_for(s.server_id)
-        status = detect_status(pkg)
-        if installed_only and status != "installed":
+    for s in _configured_registry():
+        availability, _reason = server_availability(s)
+        status = availability if s.transport_type == "websocket" else detect_status(_recipe_pkg_for(s.server_id))
+        if installed_only and status not in {"installed", "configured"}:
             continue
         sys.stdout.write(
-            f"{s.server_id:24s} [{status:11s}] {','.join(s.extensions)}\n"
+            f"{s.server_id:24s} [{status}] {','.join(s.extensions)}\n"
         )
     return 0
 
@@ -249,6 +302,14 @@ def _cmd_restart() -> int:
 def _cmd_which(server_id: str) -> int:
     from agent.lsp.install import INSTALL_RECIPES, _existing_binary
 
+    for srv in _configured_registry():
+        if srv.server_id == server_id and srv.transport_type == "websocket":
+            if srv.transport_target:
+                sys.stdout.write(f"websocket {srv.transport_target}\n")
+                return 0
+            sys.stderr.write(f"{server_id}: websocket url not configured\n")
+            return 1
+
     recipe = INSTALL_RECIPES.get(server_id)
     bin_name = (recipe or {}).get("bin", server_id)
     resolved = _existing_binary(bin_name)
@@ -257,6 +318,61 @@ def _cmd_which(server_id: str) -> int:
         return 0
     sys.stderr.write(f"{server_id}: not installed\n")
     return 1
+
+
+def _cmd_test(server_id: str) -> int:
+    registry = _configured_registry()
+    for srv in registry:
+        if srv.server_id == server_id:
+            rc, lines = _healthcheck_server_def(srv)
+            for line in lines:
+                stream = sys.stdout if rc == 0 else sys.stderr
+                stream.write(line + "\n")
+            return rc
+    sys.stderr.write(f"{server_id}: unknown LSP server\n")
+    return 2
+
+
+def _healthcheck_server_dict(srv: dict) -> tuple[int, list[str]]:
+    target = srv.get("target")
+    if srv.get("transport") != "websocket" or not target:
+        return 1, ["only configured websocket servers can be health-checked"]
+    return _healthcheck_websocket(str(srv.get("server_id") or "lsp"), str(target))
+
+
+def _healthcheck_server_def(srv) -> tuple[int, list[str]]:
+    if srv.transport_type != "websocket" or not srv.transport_target:
+        return 1, ["only configured websocket servers can be health-checked"]
+    return _healthcheck_websocket(srv.server_id, srv.transport_target)
+
+
+def _healthcheck_websocket(server_id: str, url: str) -> tuple[int, list[str]]:
+    import asyncio
+    from agent.lsp.client import LSPClient
+    from agent.lsp.transports import WebSocketLSPTransport
+
+    async def _run() -> tuple[int, list[str]]:
+        client = LSPClient(
+            server_id=server_id,
+            workspace_root="/",
+            transport=WebSocketLSPTransport(server_id, url),
+        )
+        try:
+            await client.start()
+            caps = (client.initialize_result or {}).get("capabilities")
+            if not isinstance(caps, dict):
+                await client.shutdown()
+                return 1, ["connected", "initialize: failed", "capabilities missing"]
+            await client.shutdown()
+            return 0, ["connected", "initialize: ok", "capabilities received"]
+        except Exception as e:  # noqa: BLE001
+            try:
+                await client.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            return 1, [f"connection failed: {type(e).__name__}: {e}"]
+
+    return asyncio.run(_run())
 
 
 def _recipe_pkg_for(server_id: str) -> str:

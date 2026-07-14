@@ -201,6 +201,48 @@ def build_keepalive_http_client(
         return None
 
 
+def install_provider_request_header_filter(
+    client: Any,
+    provider_id: str,
+    *,
+    async_mode: bool = False,
+) -> Any:
+    """Install a provider-declared filter on fully materialized requests."""
+    if client is None or not provider_id:
+        return client
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+        prefixes = tuple(
+            str(prefix).strip().lower()
+            for prefix in getattr(profile, "request_header_prefixes_to_strip", ())
+            if str(prefix).strip()
+        )
+        hooks = getattr(client, "event_hooks", None)
+        if not prefixes or not isinstance(hooks, dict):
+            return client
+
+        def _strip(request: Any) -> None:
+            for name in list(request.headers.keys()):
+                if any(name.lower().startswith(prefix) for prefix in prefixes):
+                    del request.headers[name]
+
+        if async_mode:
+            async def _strip_async(request: Any) -> None:
+                _strip(request)
+
+            hook = _strip_async
+        else:
+            hook = _strip
+        hooks.setdefault("request", []).append(hook)
+    except Exception:
+        # Best-effort construction-time compatibility. The provider request
+        # still surfaces its real HTTP error if discovery/client shape differs.
+        return client
+    return client
+
+
 def _install_safe_stdio() -> None:
     """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
     for stream_name in ("stdout", "stderr"):
@@ -224,4 +266,5 @@ __all__ = [
     "_get_proxy_from_env",
     "_get_proxy_for_base_url",
     "build_keepalive_http_client",
+    "install_provider_request_header_filter",
 ]

@@ -150,6 +150,11 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+def resolve_auth_store_path() -> Path:
+    """Return the shared root Hermes auth store path."""
+    return get_default_hermes_root() / "auth.json"
+
+
 def _get_packaged_data_dir(name: str) -> Path | None:
     """Return an installed data-files directory if one exists.
 

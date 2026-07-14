@@ -673,6 +673,9 @@ class GatewayKanbanWatchersMixin:
             seen.add(expanded)
             candidates.append(expanded)
 
+        from gateway.platforms.base import auto_upload_local_paths_enabled
+        allow_bare_local_paths = auto_upload_local_paths_enabled()
+
         # 1. Explicit artifacts list in payload.
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
@@ -681,15 +684,16 @@ class GatewayKanbanWatchersMixin:
                     if isinstance(item, str):
                         _add(item)
 
-            # 2. Paths embedded in the payload summary.
+            # 2. Paths embedded in the payload summary. Legacy bare-path
+            # extraction is opt-in; structured artifacts above remain explicit.
             summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
+            if allow_bare_local_paths and isinstance(summary, str) and summary:
                 paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
                     _add(p)
 
         # 3. Legacy: paths embedded in task.result.
-        if task is not None and getattr(task, "result", None):
+        if allow_bare_local_paths and task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
             for p in paths:

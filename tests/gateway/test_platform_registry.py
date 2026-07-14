@@ -983,3 +983,56 @@ class TestPluginEnablementGate:
                 )
         finally:
             _reg.unregister("myrejectedplat")
+
+
+def test_load_gateway_config_does_not_auto_enable_invalid_plugin(monkeypatch, tmp_path):
+    """Bundled plugin adapters should not enable themselves without config."""
+    from gateway.config import load_gateway_config
+    from gateway.platform_registry import PlatformEntry, platform_registry as _reg
+
+    test_entry = PlatformEntry(
+        name="needs_token",
+        label="NeedsToken",
+        adapter_factory=lambda cfg: MagicMock(),
+        check_fn=lambda: True,
+        validate_config=lambda cfg: bool((cfg.token or "").strip() or cfg.extra.get("token")),
+        source="plugin",
+    )
+    _reg.register(test_entry)
+    try:
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cfg = load_gateway_config()
+        assert "needs_token" not in {p.value for p, pcfg in cfg.platforms.items() if pcfg.enabled}
+    finally:
+        _reg.unregister("needs_token")
+
+
+def test_load_gateway_config_auto_enables_valid_plugin(monkeypatch, tmp_path):
+    """Plugin auto-enable still works when validate_config sees config/env."""
+    from gateway.config import load_gateway_config
+    from gateway.platform_registry import PlatformEntry, platform_registry as _reg
+
+    test_entry = PlatformEntry(
+        name="has_token",
+        label="HasToken",
+        adapter_factory=lambda cfg: MagicMock(),
+        check_fn=lambda: True,
+        validate_config=lambda cfg: bool((cfg.token or "").strip() or cfg.extra.get("token")),
+        source="plugin",
+    )
+    _reg.register(test_entry)
+    try:
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "platforms:\n  has_token:\n    token: configured\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        cfg = load_gateway_config()
+        assert "has_token" in {p.value for p, pcfg in cfg.platforms.items() if pcfg.enabled}
+    finally:
+        _reg.unregister("has_token")

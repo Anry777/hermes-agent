@@ -30,6 +30,7 @@ from hermes_cli.providers import (
     custom_provider_slug,
     determine_api_mode,
     get_label,
+    get_provider_plugin,
     is_aggregator,
     resolve_provider_full,
 )
@@ -1444,6 +1445,16 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
     return t
 
 
+def _provider_profile_model_ids(profile) -> list[str]:
+    """Return picker fallback ids declared by a ProviderProfile."""
+    ids = list(getattr(profile, "fallback_models", ()) or [])
+    if not ids:
+        ids = list((getattr(profile, "model_api_modes", {}) or {}).keys())
+    if not ids:
+        ids = list((getattr(profile, "model_context_lengths", {}) or {}).keys())
+    return [str(mid) for mid in ids if str(mid).strip()]
+
+
 def list_authenticated_providers(
     current_provider: str = "",
     current_base_url: str = "",
@@ -1950,6 +1961,14 @@ def list_authenticated_providers(
             # Unified pathway — same as sections 1 and 2.
             _cp_model_ids = cached_provider_model_ids(_cp.slug)
             if not _cp_model_ids:
+                try:
+                    import importlib
+                    _profile = importlib.import_module("providers").get_provider_profile(_cp.slug)
+                except Exception:
+                    _profile = None
+                if _profile is not None:
+                    _cp_model_ids = _provider_profile_model_ids(_profile)
+            if not _cp_model_ids:
                 _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
@@ -1965,6 +1984,72 @@ def list_authenticated_providers(
         })
         seen_slugs.add(_cp.slug.lower())
         _record_builtin_endpoint(_cp.slug)
+
+    # --- 2c. Provider-module plugins (bundled/user plugins under plugins/model-providers) ---
+    # These providers can be registered dynamically through ProviderProfile and
+    # may not exist in models.dev, HERMES_OVERLAYS, CANONICAL_PROVIDERS, or
+    # config.yaml providers:.  Keep the picker in sync with the resolver used by
+    # /model --provider and /mode.
+    try:
+        import importlib
+        _provider_module = importlib.import_module("providers")
+        _plugin_profiles = _provider_module.list_providers()
+    except Exception:
+        _plugin_profiles = []
+
+    for _profile in _plugin_profiles:
+        _plugin_pdef = get_provider_plugin(getattr(_profile, "name", ""))
+        if _plugin_pdef is None:
+            continue
+        _slug = _plugin_pdef.id
+        if not _slug or _slug.lower() in seen_slugs:
+            continue
+
+        _has_plugin_creds = False
+        if _plugin_pdef.auth_type == "api_key" and _plugin_pdef.api_key_env_vars:
+            _has_plugin_creds = any(os.environ.get(ev) for ev in _plugin_pdef.api_key_env_vars)
+
+        if not _has_plugin_creds:
+            try:
+                from hermes_cli.auth import _load_auth_store
+                _store = _load_auth_store()
+                if _store:
+                    _providers_store = _store.get("providers", {})
+                    _credential_pool = _store.get("credential_pool", {})
+                    if _slug in _providers_store or _credential_pool.get(_slug):
+                        _has_plugin_creds = True
+            except Exception as exc:
+                logger.debug("Auth store check failed for provider plugin %s: %s", _slug, exc)
+
+        if not _has_plugin_creds:
+            try:
+                from agent.credential_pool import load_pool
+                _plugin_pool = load_pool(_slug)
+                if _plugin_pool.has_credentials():
+                    _has_plugin_creds = True
+            except Exception as exc:
+                logger.debug("Credential pool check failed for provider plugin %s: %s", _slug, exc)
+
+        if not _has_plugin_creds:
+            continue
+
+        _plugin_model_ids = cached_provider_model_ids(_slug)
+        if not _plugin_model_ids:
+            _plugin_model_ids = _provider_profile_model_ids(_profile)
+        if not _plugin_model_ids:
+            _plugin_model_ids = curated.get(_slug, [])
+
+        results.append({
+            "slug": _slug,
+            "name": _plugin_pdef.name,
+            "is_current": _slug == current_provider,
+            "is_user_defined": False,
+            "models": _plugin_model_ids[:max_models],
+            "total_models": len(_plugin_model_ids),
+            "source": "provider-plugin",
+        })
+        seen_slugs.add(_slug.lower())
+        _record_builtin_endpoint(_slug)
 
     # --- 3. User-defined endpoints from config ---
     # Track (name, base_url) of what section 3 emits so section 4 can skip

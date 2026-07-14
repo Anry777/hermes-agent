@@ -962,6 +962,7 @@ _CACHE_DIR_IMPORT_DEFAULTS = {
 
 _HERMES_HOME = get_hermes_home()
 _HERMES_ROOT = get_default_hermes_root()
+MEDIA_DELIVERY_AUTO_UPLOAD_LOCAL_PATHS_ENV = "HERMES_GATEWAY_AUTO_UPLOAD_LOCAL_PATHS"
 MEDIA_DELIVERY_ALLOW_DIRS_ENV = "HERMES_MEDIA_ALLOW_DIRS"
 MEDIA_DELIVERY_TRUST_RECENT_ENV = "HERMES_MEDIA_TRUST_RECENT_FILES"
 MEDIA_DELIVERY_TRUST_RECENT_SECONDS_ENV = "HERMES_MEDIA_TRUST_RECENT_SECONDS"
@@ -1104,6 +1105,12 @@ def _media_delivery_recency_seconds() -> float:
     except (TypeError, ValueError):
         pass
     return float(_MEDIA_DELIVERY_TRUST_RECENT_DEFAULT_SECONDS)
+
+
+def auto_upload_local_paths_enabled() -> bool:
+    """Return True when bare local paths in assistant text are upload candidates."""
+    raw = os.environ.get(MEDIA_DELIVERY_AUTO_UPLOAD_LOCAL_PATHS_ENV, "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _media_delivery_strict_mode() -> bool:
@@ -2407,6 +2414,27 @@ class BasePlatformAdapter(ABC):
         Python ``len`` (e.g. Telegram counts UTF-16 code units).
         """
         return len
+
+    @property
+    def suppress_home_channel_onboarding(self) -> bool:
+        """Whether first-run home-channel setup notices should stay silent.
+
+        Most bot-oriented platforms keep the default onboarding prompt. Adapters
+        intended to behave as ordinary user accounts can override this to avoid
+        sending an unsolicited Hermes setup message into a personal chat.
+        """
+        return False
+
+    @property
+    def suppress_system_messages(self) -> bool:
+        """Whether Hermes-owned command and failure notices should stay silent.
+
+        Bot-oriented platforms keep the default interactive gateway UX. Adapters
+        that represent an ordinary user account can opt in so known gateway
+        commands are ignored, internal failures stay server-side, and approval
+        prompts fail closed instead of exposing bot control surfaces.
+        """
+        return False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -4601,6 +4629,28 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        # Human-account transports expose no Hermes command control plane.
+        # Drop only commands recognized by the real gateway registry before any
+        # active-session guard, task, debounce, or pending-message mutation.
+        if self.suppress_system_messages is True:
+            cmd = event.get_command()
+            if cmd:
+                from hermes_cli.commands import (
+                    is_gateway_known_command,
+                    resolve_command,
+                )
+
+                command_def = resolve_command(cmd)
+                canonical = command_def.name if command_def is not None else cmd
+                if is_gateway_known_command(canonical):
+                    logger.info(
+                        "[%s] Silently ignored gateway command '/%s' before "
+                        "session dispatch",
+                        self.name,
+                        canonical,
+                    )
+                    return
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -4915,7 +4965,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
                 local_files = []
-                if not is_ephemeral_response:
+                if not is_ephemeral_response and auto_upload_local_paths_enabled():
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
@@ -5210,25 +5260,29 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            # Human-account transports keep framework failures server-side.
+            # Bot-style transports retain the existing user-facing notice.
+            if self.suppress_system_messages is not True:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(
+                        event.source, _reply_anchor_for_event(event)
+                    )
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
         finally:
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not

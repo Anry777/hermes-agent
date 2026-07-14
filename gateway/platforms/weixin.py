@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    auto_upload_local_paths_enabled,
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
@@ -1852,8 +1853,12 @@ class WeixinAdapter(BasePlatformAdapter):
         media_files, cleaned_content = self.extract_media(content)
         media_files = self.filter_media_delivery_paths(media_files)
         _, image_cleaned = self.extract_images(cleaned_content)
-        local_files, final_content = self.extract_local_files(image_cleaned)
-        local_files = self.filter_local_delivery_paths(local_files)
+        if auto_upload_local_paths_enabled():
+            local_files, final_content = self.extract_local_files(image_cleaned)
+            local_files = self.filter_local_delivery_paths(local_files)
+        else:
+            local_files = []
+            final_content = image_cleaned
 
         _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}

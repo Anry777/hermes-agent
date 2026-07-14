@@ -1,0 +1,34 @@
+name: max-userbot-platform
+label: MAX Userbot
+kind: platform
+version: 0.1.0
+description: >
+  Experimental MAX messenger userbot gateway adapter for Hermes Agent.
+  Uses MaxApiTeam/PyMax (maxapi-python) and the unofficial internal MAX
+  Manager API to run through a user account when official Bot API tokens
+  are unavailable. This is not an official MAX Bot API integration.
+author: Hermes PatchKit
+pip_dependencies:
+  - maxapi-python>=2.3.1
+requires_env:
+  - name: MAX_USERBOT_PHONE
+    description: "Phone number for PyMax TCP Client first-time SMS authorization"
+    prompt: "MAX account phone number"
+    password: false
+optional_env:
+  - name: MAX_USERBOT_2FA_PASSWORD
+    description: "Optional MAX 2FA password used during first-time authorization"
+    prompt: "MAX 2FA password (optional)"
+    password: true
+  - name: MAX_USERBOT_ALLOWED_USERS
+    description: "Comma-separated MAX user IDs allowed to talk to Hermes"
+    prompt: "Allowed MAX user IDs"
+    password: false
+  - name: MAX_USERBOT_ALLOWED_CHATS
+    description: "Comma-separated MAX chat IDs allowed to talk to Hermes"
+    prompt: "Allowed MAX chat IDs"
+    password: false
+  - name: MAX_USERBOT_ALLOW_ALL_USERS
+    description: "Allow any MAX user/chat to talk to Hermes (unsafe except for dev)"
+    prompt: "Allow all users? (true/false)"
+    password: false

@@ -533,8 +533,9 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
 
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
-    MiniMax's global and China Anthropic-compatible endpoints, and Azure AI
-    Foundry's Anthropic-style endpoint follow this pattern.
+    MiniMax's global and China Anthropic-compatible endpoints, Azure AI
+    Foundry's Anthropic-style endpoint, and VibeMode's Messages gateway follow
+    this pattern.
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
@@ -542,6 +543,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     normalized = normalized.rstrip("/").lower()
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
+        or base_url_host_matches(normalized, "api.vibemod.pro")
         or "azure.com" in normalized
     )
 
@@ -705,6 +707,7 @@ def build_anthropic_client(
     base_url: str = None,
     timeout: float = None,
     *,
+    default_headers: Optional[Dict[str, str]] = None,
     drop_context_1m_beta: bool = False,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
@@ -725,6 +728,12 @@ def build_anthropic_client(
     per-model ``request_timeout_seconds`` config so Anthropic-native and
     Anthropic-compatible providers respect the same knob as OpenAI-wire
     providers.
+
+    ``default_headers`` carries provider-profile client headers for
+    Anthropic-compatible third-party endpoints.  This is intentionally a
+    client-level merge so WAF-facing headers such as VibeMode's stable
+    User-Agent reach the Messages transport just like they already reach the
+    OpenAI-compatible transports.
 
     ``drop_context_1m_beta=True`` strips ``context-1m-2025-08-07`` from the
     client-level ``anthropic-beta`` header. Used by the reactive OAuth retry
@@ -825,6 +834,11 @@ def build_anthropic_client(
         kwargs["api_key"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+
+    if default_headers:
+        merged_headers = dict(default_headers)
+        merged_headers.update(kwargs.get("default_headers") or {})
+        kwargs["default_headers"] = merged_headers
 
     return _anthropic_sdk.Anthropic(**kwargs)
 

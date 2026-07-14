@@ -855,6 +855,23 @@ def recover_with_credential_pool(
         return False, True
 
     if effective_reason == FailoverReason.auth:
+        _auth_haystack = " ".join(
+            str(error_context.get(k) or "").lower()
+            for k in ("message", "reason", "code", "error")
+            if isinstance(error_context, dict)
+        )
+        if status_code == 403 and (
+            "your request was blocked" in _auth_haystack
+            or "error code: 1010" in _auth_haystack
+            or "cloudflare" in _auth_haystack
+        ):
+            _ra().logger.info(
+                "Credential %s — WAF-shaped 403 from %s; skipping pool "
+                "refresh/rotation because the credential itself is unproven.",
+                status_code if status_code is not None else "auth",
+                agent.provider or "provider",
+            )
+            return False, has_retried_429
         # Subscription/entitlement 403s look like auth failures on the wire
         # but refresh cannot fix them — the OAuth token is already valid,
         # the account simply lacks the entitlement.  Without this guard,
@@ -877,11 +894,6 @@ def recover_with_credential_pool(
         # long-running TUI sessions stuck on stale tokens until the user
         # exited and reopened.
         is_entitlement = agent._is_entitlement_failure(error_context, status_code)
-        _auth_haystack = " ".join(
-            str(error_context.get(k) or "").lower()
-            for k in ("message", "reason", "code", "error")
-            if isinstance(error_context, dict)
-        )
         if (
             not is_entitlement
             and status_code == 403
@@ -1703,6 +1715,13 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+    if client_kwargs.get("http_client") is not None:
+        from agent.process_bootstrap import install_provider_request_header_filter
+
+        install_provider_request_header_filter(
+            client_kwargs["http_client"],
+            agent.provider,
+        )
     # Delegate all rate-limit / 5xx retry to hermes's outer conversation loop,
     # which honors Retry-After and applies adaptive/jittered backoff. The OpenAI
     # SDK default (max_retries=2) uses its own 1-2s backoff that ignores

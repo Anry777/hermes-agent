@@ -216,6 +216,11 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _system_messages_suppressed(adapter: Any) -> bool:
+    """Return True only when an adapter explicitly opts out of system UI."""
+    return getattr(adapter, "suppress_system_messages", False) is True
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -1791,6 +1796,21 @@ _OWN_POLICY_OPEN_ENV = {
     Platform.QQBOT: (None, None, "QQ_ALLOW_ALL_USERS"),
     Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS"),
 }
+
+
+def _adapter_can_render_tool_progress(adapter: object) -> bool:
+    """Return True when progress updates can render without noisy bubbles."""
+    if getattr(adapter, "SUPPORTS_PROGRESS_MESSAGES_WITHOUT_EDIT", False):
+        return True
+    return type(adapter).edit_message is not BasePlatformAdapter.edit_message
+
+
+def _adapter_uses_permanent_tool_progress(adapter: object) -> bool:
+    """Return True when progress is renderable only as permanent sends."""
+    return (
+        bool(getattr(adapter, "SUPPORTS_PROGRESS_MESSAGES_WITHOUT_EDIT", False))
+        and type(adapter).edit_message is BasePlatformAdapter.edit_message
+    )
 
 
 def _own_policy_open_startup_violation(config) -> Optional[str]:
@@ -8845,6 +8865,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Human-account transports must not expose Hermes's bot control plane.
+        # Ignore only commands known to the gateway; unknown slash-prefixed text
+        # remains ordinary conversation input.
+        _system_adapter = self._adapter_for_source(source)
+        if _system_messages_suppressed(_system_adapter):
+            _system_command = event.get_command()
+            if _system_command:
+                from hermes_cli.commands import (
+                    is_gateway_known_command as _is_gateway_known_system_command,
+                    resolve_command as _resolve_system_command,
+                )
+
+                _system_command_def = _resolve_system_command(_system_command)
+                _system_canonical = (
+                    _system_command_def.name
+                    if _system_command_def is not None
+                    else _system_command
+                )
+                if _is_gateway_known_system_command(_system_canonical):
+                    logger.info(
+                        "Silently ignored gateway command /%s on system-message-"
+                        "suppressed platform %s",
+                        _system_canonical,
+                        source.platform.value if source.platform else "unknown",
+                    )
+                    return None
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -10698,8 +10745,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
+            reset_parent_id = getattr(session_entry, 'parent_session_id', None)
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
+            elif reset_parent_id:
+                context_note = (
+                    "[System note: The user's session was automatically reset, "
+                    "and the previous transcript has been rehydrated into the "
+                    "conversation history. Continue from the prior context.]"
+                )
             elif reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
@@ -10737,6 +10791,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
                         notice = (
+                            f"◐ Session automatically reset ({reason_text}). "
+                            f"Conversation history restored automatically.\n"
+                            f"Use /resume to browse or switch to another previous session.\n"
+                            f"Adjust reset timing in config.yaml under session_reset."
+                        ) if reset_parent_id else (
                             f"◐ Session automatically reset ({reason_text}). "
                             f"Conversation history cleared.\n"
                             f"Use /resume to browse and restore a previous session.\n"
@@ -10797,8 +10856,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from transcript.  For gateway daily/idle
+        # auto-reset children, prepend reset-parent transcripts so the chat
+        # continues automatically instead of requiring a manual /resume.
+        history = self.session_store.load_transcript(
+            session_entry.session_id,
+            include_reset_parents=True,
+        )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -11208,7 +11272,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        _home_onboarding_adapter = self._adapter_for_source(source)
+        _suppress_home_onboarding = (
+            getattr(_home_onboarding_adapter, "suppress_home_channel_onboarding", False)
+            is True
+        )
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and not _suppress_home_onboarding
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -11944,6 +12019,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
+            if _system_messages_suppressed(self._adapter_for_source(source)):
+                logger.info(
+                    "Suppressed agent failure notice on platform %s",
+                    source.platform.value if source.platform else "unknown",
+                )
+                return None
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
@@ -12928,7 +13009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import BasePlatformAdapter, auto_upload_local_paths_enabled, should_send_media_as_audio
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -12940,8 +13021,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # producing false-positive bare-path matches with the MEDIA: prefix
             # glued on. This matches the chain order in gateway/platforms/base.py.
             _, cleaned = adapter.extract_images(cleaned)
-            local_files, _ = adapter.extract_local_files(cleaned)
-            local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            if auto_upload_local_paths_enabled():
+                local_files, _ = adapter.extract_local_files(cleaned)
+                local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            else:
+                local_files = []
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -17032,6 +17116,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _progress_adapter = self._adapter_for_source(source)
             except Exception:
                 _progress_adapter = None
+            _platform_value = str(getattr(source.platform, "value", source.platform)).lower()
+            _compact_persistent_progress = _platform_value == "max"
             if (
                 getattr(_progress_adapter, "supports_code_blocks", False)
                 and tool_name == "terminal"
@@ -17089,7 +17175,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compact — unlike CLI spinners, these persist as permanent messages).
             # Terminal commands on markdown platforms get a single-line capped
             # fenced block (built above) instead of the truncated preview.
-            if _code_block_short is not None:
+            if _compact_persistent_progress:
+                # MAX progress bubbles are persistent chat messages even when
+                # they can be rendered, so keep them compact and avoid leaking
+                # raw command/URL previews into the transcript.
+                msg = f"{emoji} {tool_name}..."
+                last_was_terminal_block[0] = False
+            elif _code_block_short is not None:
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
             elif preview:
@@ -17226,7 +17318,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update
             # would become a separate message bubble, which is noisy.
-            if type(adapter).edit_message is BasePlatformAdapter.edit_message:
+            if not _adapter_can_render_tool_progress(adapter):
                 while not progress_queue.empty():
                     try:
                         progress_queue.get_nowait()
@@ -17238,6 +17330,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_msg_id = None   # ID of the current progress message to edit
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
+            if str(getattr(source.platform, "value", source.platform)).lower() == "max":
+                # MAX progress is persisted as chat content, so coalesce the
+                # first burst before sending the initial progress bubble.
+                _last_edit_ts = time.monotonic()
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
             _progress_len_fn = (
@@ -17532,7 +17628,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
-                    # Final edit with all remaining tools (only if editing works)
+                    # Final send/edit with all remaining tools (only if rendering works)
+                    if can_edit and progress_lines and progress_msg_id is None:
+                        try:
+                            _result = await _send_progress_text(_progress_text(progress_lines))
+                            if getattr(_result, "success", False) and getattr(_result, "message_id", None):
+                                progress_msg_id = _result.message_id
+                        except Exception:
+                            pass
                     if can_edit and progress_lines and progress_msg_id:
                         await _roll_progress_overflow_if_needed()
                     if can_edit and progress_lines and progress_msg_id:
@@ -18274,6 +18377,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+                # Human-account transports intentionally expose no approval UI.
+                # Raising is fail-closed: tools.approval drops the queued entry
+                # and returns a blocked result instead of waiting or sending text.
+                if _system_messages_suppressed(_status_adapter):
+                    raise RuntimeError(
+                        "Gateway approval prompts are disabled for this platform"
+                    )
+
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
                 # assistant_threads_setStatus disables the compose box — the

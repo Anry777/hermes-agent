@@ -4170,7 +4170,40 @@ class TelegramAdapter(BasePlatformAdapter):
                         parse_mode=ParseMode.MARKDOWN_V2,
                     )
                 except Exception as fmt_err:
-                    if "not modified" not in str(fmt_err).lower():
+                    err_str = str(fmt_err).lower()
+                    if "not modified" not in err_str:
+                        retry_after = getattr(fmt_err, "retry_after", None)
+                        is_flood = (
+                            retry_after is not None
+                            or "retry after" in err_str
+                            or "flood control exceeded" in err_str
+                        )
+                        if is_flood:
+                            delivered_prefix = re.sub(
+                                r" \\(\\d+/\\d+\\)$", "", first_chunk
+                            )
+                            logger.warning(
+                                "[%s] Overflow split: first-chunk finalize edit "
+                                "flood-limited; preserving visible prefix and "
+                                "falling back to tail delivery: %s",
+                                self.name, fmt_err,
+                            )
+                            return SendResult(
+                                success=False,
+                                message_id=message_id,
+                                error="overflow_first_chunk_flood_control",
+                                retryable=False,
+                                retry_after=retry_after,
+                                raw_response={
+                                    "partial_overflow": True,
+                                    "delivered_chunks": 1,
+                                    "total_chunks": len(chunks),
+                                    "last_message_id": message_id,
+                                    "delivered_prefix": delivered_prefix,
+                                    "continuation_message_ids": (),
+                                },
+                                continuation_message_ids=(),
+                            )
                         logger.warning(
                             "[%s] Overflow split: MarkdownV2 first-chunk edit "
                             "failed, falling back to plain text: %s",

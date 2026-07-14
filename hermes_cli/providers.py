@@ -398,6 +398,63 @@ def normalize_provider(name: str) -> str:
     return ALIASES.get(key, key)
 
 
+def _provider_profile_to_def(profile: Any) -> ProviderDef:
+    """Convert a provider-module ProviderProfile into the model-switch ProviderDef.
+
+    Provider profiles use ``api_mode`` (``chat_completions``,
+    ``codex_responses``, ...), while the model-switch provider catalog stores
+    the corresponding transport name.  Keep this conversion in one place so
+    plugin-backed providers behave like built-ins without requiring duplicate
+    ``config.yaml providers:`` entries.
+    """
+    api_mode = str(getattr(profile, "api_mode", "") or "chat_completions")
+    api_mode_to_transport = {v: k for k, v in TRANSPORT_TO_API_MODE.items()}
+    transport = api_mode_to_transport.get(api_mode, api_mode)
+    if transport not in TRANSPORT_TO_API_MODE:
+        transport = "openai_chat"
+
+    env_vars = tuple(str(v) for v in (getattr(profile, "env_vars", ()) or ()) if v)
+    api_key_env_vars = tuple(
+        v for v in env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL")
+    )
+    base_url_env_var = next(
+        (v for v in env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")),
+        "",
+    )
+
+    return ProviderDef(
+        id=str(getattr(profile, "name", "") or ""),
+        name=str(getattr(profile, "display_name", "") or getattr(profile, "name", "")),
+        transport=transport,
+        api_key_env_vars=api_key_env_vars or env_vars,
+        base_url=str(getattr(profile, "base_url", "") or ""),
+        base_url_env_var=base_url_env_var,
+        is_aggregator=False,
+        auth_type=str(getattr(profile, "auth_type", "api_key") or "api_key"),
+        doc=str(getattr(profile, "signup_url", "") or ""),
+        source="provider-plugin",
+    )
+
+
+def get_provider_plugin(name: str) -> Optional[ProviderDef]:
+    """Resolve a provider-module plugin profile into a ProviderDef.
+
+    This covers bundled and user plugins under ``plugins/model-providers/*``.
+    It is intentionally separate from :func:`get_provider`, which remains the
+    built-in/models.dev resolver used by older callers.
+    """
+    try:
+        import importlib
+        provider_module = importlib.import_module("providers")
+        profile = provider_module.get_provider_profile(name.strip().lower())
+    except Exception:
+        profile = None
+    if profile is None:
+        return None
+    pdef = _provider_profile_to_def(profile)
+    return pdef if pdef.id else None
+
+
 def get_provider(name: str) -> Optional[ProviderDef]:
     """Look up a built-in provider by id or alias.
 
@@ -476,8 +533,13 @@ def get_label(provider_id: str) -> str:
     if canonical in _LABEL_OVERRIDES:
         return _LABEL_OVERRIDES[canonical]
 
-    # Try models.dev
+    # Try models.dev / Hermes overlays
     pdef = get_provider(canonical)
+    if pdef:
+        return pdef.name
+
+    # Try provider-module plugins (bundled or user plugins)
+    pdef = get_provider_plugin(canonical)
     if pdef:
         return pdef.name
 
@@ -551,6 +613,10 @@ def determine_api_mode(provider: str, base_url: str = "") -> str:
             if "api.openai.com" in url_lower:
                 return "codex_responses"
         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
+
+    plugin_pdef = get_provider_plugin(provider)
+    if plugin_pdef is not None:
+        return TRANSPORT_TO_API_MODE.get(plugin_pdef.transport, "chat_completions")
 
     # Direct provider checks for providers not in HERMES_OVERLAYS
     if provider == "bedrock":
@@ -750,6 +816,11 @@ def resolve_provider_full(
     custom_pdef = resolve_custom_provider(name, custom_providers)
     if custom_pdef is not None:
         return custom_pdef
+
+    # 2c. Provider-module plugins (bundled/user plugins under plugins/model-providers)
+    plugin_pdef = get_provider_plugin(canonical) or get_provider_plugin(name)
+    if plugin_pdef is not None:
+        return plugin_pdef
 
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:

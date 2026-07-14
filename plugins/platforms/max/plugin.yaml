@@ -1,0 +1,10 @@
+name: max-platform
+kind: platform
+version: 1.0.0
+description: >
+  MAX messenger gateway adapter for Hermes Agent. Provides webhook-first
+  production inbound delivery, explicit polling fallback for local testing,
+  native image/file attachments, and MAX Markdown formatting.
+author: Hermes PatchKit
+requires_env:
+  - MAX_BOT_TOKEN

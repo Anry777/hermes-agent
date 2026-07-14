@@ -2211,6 +2211,43 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                             entry.name,
                         )
                         continue
+                else:
+                    probe_cfg = existing_cfg or PlatformConfig(enabled=True)
+                    if not probe_cfg.enabled:
+                        probe_cfg = PlatformConfig(
+                            enabled=True,
+                            token=probe_cfg.token,
+                            extra=dict(probe_cfg.extra or {}),
+                        )
+                    if isinstance(seed_for_probe, dict) and seed_for_probe:
+                        probe_extra = dict(getattr(probe_cfg, "extra", {}) or {})
+                        for k, v in seed_for_probe.items():
+                            if k == "home_channel":
+                                continue
+                            probe_extra.setdefault(k, v)
+                        probe_cfg = PlatformConfig(
+                            enabled=True,
+                            token=getattr(probe_cfg, "token", ""),
+                            extra=probe_extra,
+                        )
+                    if entry.validate_config is not None:
+                        try:
+                            configured = bool(entry.validate_config(probe_cfg))
+                        except Exception as exc:
+                            logger.debug(
+                                "validate_config for %s raised: %s — skipping enablement",
+                                entry.name, exc,
+                            )
+                            configured = False
+                    else:
+                        configured = True
+                    if not configured:
+                        logger.debug(
+                            "Plugin platform '%s' available but not configured "
+                            "(validate_config returned False) — skipping enable",
+                            entry.name,
+                        )
+                        continue
             # Verify dependencies LAST — only for platforms that are already
             # enabled or passed the credential gate above.  For adapter plugins
             # ``check_fn`` lazy-INSTALLS the platform SDK (pip) as a side

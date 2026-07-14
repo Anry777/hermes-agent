@@ -48,9 +48,16 @@ from agent.lsp.client import (
 )
 from agent.lsp.servers import (
     ServerContext,
+
+    ServerDef,
+    SpawnSpec,
+    build_servers_from_lsp_config,
+
     find_server_for_file,
     language_id_for,
+    server_availability,
 )
+from agent.lsp.transports import WebSocketLSPTransport
 from agent.lsp.workspace import (
     clear_cache,
     resolve_workspace_for_file,
@@ -155,6 +162,8 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        servers: Optional[List[ServerDef]] = None,
+        language_by_ext: Optional[Dict[str, str]] = None,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -165,6 +174,8 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._servers = list(servers) if servers is not None else None
+        self._language_by_ext = dict(language_by_ext) if language_by_ext is not None else None
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -226,6 +237,7 @@ class LSPService:
                 if isinstance(init, dict):
                     init_overrides[name] = init
 
+        configured_servers, language_by_ext = build_servers_from_lsp_config(lsp_cfg)
         return cls(
             enabled=enabled,
             wait_mode=wait_mode,
@@ -235,6 +247,8 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            servers=configured_servers,
+            language_by_ext=language_by_ext,
         )
 
     # ------------------------------------------------------------------
@@ -244,6 +258,16 @@ class LSPService:
     def is_active(self) -> bool:
         """Return True iff this service should be consulted at all."""
         return self._enabled
+
+    def _find_server_for_file(self, file_path: str) -> Optional[ServerDef]:
+        return find_server_for_file(file_path, servers=self._servers)
+
+    def _language_id_for(self, file_path: str) -> str:
+        return language_id_for(file_path, language_by_ext=self._language_by_ext)
+
+    def _registry(self) -> List[ServerDef]:
+        from agent.lsp.servers import SERVERS
+        return list(self._servers) if self._servers is not None else list(SERVERS)
 
     def enabled_for(self, file_path: str) -> bool:
         """Return True iff LSP should run for this specific file.
@@ -260,7 +284,7 @@ class LSPService:
         """
         if not self._enabled:
             return False
-        srv = find_server_for_file(file_path)
+        srv = self._find_server_for_file(file_path)
         if srv is None or srv.server_id in self._disabled_servers:
             return False
         ws_root, gated_in = resolve_workspace_for_file(file_path)
@@ -336,7 +360,7 @@ class LSPService:
 
         # Resolve server_id eagerly so we can emit structured logs even
         # when the request errors out below.
-        srv = find_server_for_file(file_path)
+        srv = self._find_server_for_file(file_path)
         server_id = srv.server_id if srv else "?"
 
         try:
@@ -400,7 +424,7 @@ class LSPService:
         ``exc`` is whatever exception the outer wrapper caught — used
         only for logging, never re-raised.
         """
-        srv = find_server_for_file(file_path)
+        srv = self._find_server_for_file(file_path)
         if srv is None:
             return
         ws_root, gated = resolve_workspace_for_file(file_path)
@@ -451,7 +475,7 @@ class LSPService:
         if client is None:
             return []
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
+            version = await client.open_file(file_path, language_id=self._language_id_for(file_path))
             await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
@@ -464,7 +488,7 @@ class LSPService:
         if client is None:
             return []
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
+            version = await client.open_file(file_path, language_id=self._language_id_for(file_path))
             await client.save_file(file_path)
             await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
@@ -475,7 +499,7 @@ class LSPService:
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
         ws, gated = resolve_workspace_for_file(file_path)
-        srv = find_server_for_file(file_path)
+        srv = self._find_server_for_file(file_path)
         if not (ws and gated and srv):
             return []
         with self._state_lock:
@@ -485,7 +509,7 @@ class LSPService:
         return list(client.diagnostics_for(file_path))
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
-        srv = find_server_for_file(file_path)
+        srv = self._find_server_for_file(file_path)
         if srv is None:
             return None
         if srv.server_id in self._disabled_servers:
@@ -540,6 +564,14 @@ class LSPService:
                 self._broken.add(key)
                 spawn_future.set_result(None)
                 return None
+            transport = None
+            if spec.transport == "websocket":
+                if not spec.url:
+                    eventlog.log_server_unavailable(srv.server_id, "websocket url")
+                    self._broken.add(key)
+                    spawn_future.set_result(None)
+                    return None
+                transport = WebSocketLSPTransport(srv.server_id, spec.url)
             client = LSPClient(
                 server_id=srv.server_id,
                 workspace_root=spec.workspace_root,
@@ -548,6 +580,7 @@ class LSPService:
                 cwd=spec.cwd,
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
+                transport=transport,
             )
             try:
                 await client.start()
@@ -594,6 +627,21 @@ class LSPService:
                 for k, c in self._clients.items()
             ]
             broken = list(self._broken)
+        servers = []
+        for srv in self._registry():
+            availability, reason = server_availability(srv)
+            servers.append(
+                {
+                    "server_id": srv.server_id,
+                    "extensions": list(srv.extensions),
+                    "description": srv.description,
+                    "source": "configured" if srv.configured else "builtin",
+                    "transport": srv.transport_type,
+                    "target": srv.transport_target,
+                    "availability": availability,
+                    "availability_reason": reason,
+                }
+            )
         return {
             "enabled": self._enabled,
             "wait_mode": self._wait_mode,
@@ -602,6 +650,7 @@ class LSPService:
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
+            "servers": servers,
         }
 
 
